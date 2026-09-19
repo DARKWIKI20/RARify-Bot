@@ -314,7 +314,15 @@ async def run_rar_test(rar_file: str, task_id: str) -> tuple[bool, str]:
 async def download_stream_url(url: str, dest_path: str, status_msg: Message, task_id: str) -> tuple[bool, str]:
     state = {"start_time": time.time(), "last_update": 0}
     timeout = aiohttp.ClientTimeout(total=7200)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+        "Accept": "*/*",
+        "Accept-Encoding": "identity",
+        "Connection": "keep-alive"
+    }
+
+    async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
         async with session.get(url, allow_redirects=True) as resp:
             if resp.status != 200:
                 return False, f"HTTP Status {resp.status}: {resp.reason}"
