@@ -13,7 +13,12 @@ from urllib.parse import unquote, urlparse
 import aiohttp
 from aiohttp import web
 from pyrogram import Client, filters
-from pyrogram.types import Message
+from pyrogram.types import (
+    Message,
+    CallbackQuery,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton
+)
 from pyrogram.errors import FloodWait
 
 logging.basicConfig(
@@ -46,6 +51,7 @@ if not API_HASH or not BOT_TOKEN:
     sys.exit(1)
 
 task_semaphore = asyncio.Semaphore(1)
+PENDING_TASKS = {}
 
 app = Client(
     "rar_worker_bot",
@@ -65,6 +71,11 @@ def human_size(size_bytes: int) -> str:
 def sanitize_filename(name: str) -> str:
     cleaned = re.sub(r'[\\/*?:"<>|]', "_", name).strip()
     return cleaned if cleaned else "archive"
+
+def is_authorized(user_id: int) -> bool:
+    if not ALLOWED_USERS:
+        return True
+    return user_id in ALLOWED_USERS
 
 async def progress_callback(current, total, status_msg: Message, action_name: str, state: dict):
     now = time.time()
@@ -86,10 +97,24 @@ async def progress_callback(current, total, status_msg: Message, action_name: st
     except Exception:
         pass
 
-def is_authorized(user_id: int) -> bool:
-    if not ALLOWED_USERS:
-        return True
-    return user_id in ALLOWED_USERS
+async def update_compression_progress(percent: int, status_msg: Message, state: dict):
+    now = time.time()
+    if now - state.get("last_update", 0) < 4 and percent < 100:
+        return
+    state["last_update"] = now
+    filled = int(percent // 10)
+    bar = "█" * filled + "░" * (10 - filled)
+    text = (
+        f"**Status:** Compressing to RAR (-m5)\n"
+        f"[{bar}] {percent}%\n"
+        f"Mode: Best | Dict: 64MB | RR: 5%"
+    )
+    try:
+        await status_msg.edit_text(text)
+    except FloodWait as e:
+        await asyncio.sleep(e.value)
+    except Exception:
+        pass
 
 async def send_detailed_error(message: Message, status_msg: Message, stage: str, exc: Exception, extra_log: str = ""):
     tb = traceback.format_exc()
@@ -136,7 +161,7 @@ async def extract_archive_if_needed(file_path: str, extract_to: str) -> tuple[bo
         return (proc.returncode == 0), out_log
     return False, ""
 
-async def run_rar_compression(input_target: str, output_rar_archive: str) -> tuple[bool, str]:
+async def run_rar_compression(input_target: str, output_rar_archive: str, status_msg: Message) -> tuple[bool, str]:
     cmd = [
         "rar", "a",
         "-m5",
@@ -155,9 +180,42 @@ async def run_rar_compression(input_target: str, output_rar_archive: str) -> tup
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE
     )
+
+    full_log = []
+    buf = ""
+    state = {"last_update": 0}
+
+    while True:
+        chunk = await proc.stdout.read(64)
+        if not chunk:
+            break
+        text = chunk.decode(errors="ignore")
+        full_log.append(text)
+        buf += text
+
+        matches = re.findall(r"(\d{1,3})%", buf)
+        if matches:
+            percent = int(matches[-1])
+            if 0 <= percent <= 100:
+                await update_compression_progress(percent, status_msg, state)
+
+        if len(buf) > 256:
+            buf = buf[-64:]
+
+    _, stderr_data = await proc.communicate()
+    full_log.append(stderr_data.decode(errors="ignore"))
+    return (proc.returncode == 0), "".join(full_log)
+
+async def run_rar_test(rar_file: str) -> tuple[bool, str]:
+    cmd = ["rar", "t", "-y", rar_file]
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE
+    )
     stdout, stderr = await proc.communicate()
-    out_log = stdout.decode(errors="ignore") + "\n" + stderr.decode(errors="ignore")
-    return (proc.returncode == 0), out_log
+    log = stdout.decode(errors="ignore") + "\n" + stderr.decode(errors="ignore")
+    return (proc.returncode == 0), log
 
 async def download_stream_url(url: str, dest_path: str, status_msg: Message) -> tuple[bool, str]:
     state = {"last_update": 0}
@@ -185,6 +243,102 @@ def find_rar_outputs(work_dir: str) -> list[str]:
     rar_files.sort()
     return rar_files
 
+async def process_task(task_id: str, should_test: bool):
+    task_data = PENDING_TASKS.pop(task_id, None)
+    if not task_data:
+        return
+
+    message = task_data["message"]
+    status_msg = task_data["status_msg"]
+    mode = task_data["mode"]
+    url = task_data.get("url")
+
+    work_dir = os.path.join("/tmp", f"rar_{uuid.uuid4().hex}")
+    os.makedirs(work_dir, exist_ok=True)
+    stage = "Queue"
+    extra_log = ""
+
+    async with task_semaphore:
+        try:
+            if mode == "file":
+                stage = "Downloading from Telegram"
+                await status_msg.edit_text(f"Status: {stage}...")
+                state = {"last_update": 0}
+
+                file_attr = message.document or message.video or message.audio
+                orig_name = getattr(file_attr, "file_name", None) or "input_file"
+                orig_name = sanitize_filename(orig_name)
+                save_dest = os.path.join(work_dir, orig_name)
+
+                file_path = await message.download(
+                    file_name=save_dest,
+                    progress=progress_callback,
+                    progress_args=(status_msg, stage, state)
+                )
+                base_name = sanitize_filename(os.path.splitext(orig_name)[0])
+            else:
+                stage = "Downloading URL"
+                parsed = urlparse(url)
+                raw_filename = unquote(os.path.basename(parsed.path)) or "downloaded_file"
+                raw_filename = sanitize_filename(raw_filename)
+                file_path = os.path.join(work_dir, raw_filename)
+
+                await status_msg.edit_text(f"Status: {stage}...")
+                download_ok, dl_err = await download_stream_url(url, file_path, status_msg)
+                if not download_ok:
+                    raise RuntimeError(f"URL download failed: {dl_err}")
+                base_name = sanitize_filename(os.path.splitext(raw_filename)[0])
+
+            extract_dir = os.path.join(work_dir, f"{base_name}_extracted")
+            stage = "Extracting Archive"
+            extracted, ext_log = await extract_archive_if_needed(file_path, extract_dir)
+            extra_log += f"\n--- Extraction Log ---\n{ext_log}"
+
+            target = extract_dir if extracted else file_path
+
+            stage = "Compressing to RAR (-m5)"
+            rar_target = os.path.join(work_dir, f"{base_name}.rar")
+            await status_msg.edit_text(f"Status: {stage} (0%)...")
+            success, rar_log = await run_rar_compression(target, rar_target, status_msg)
+            extra_log += f"\n--- RAR Log ---\n{rar_log}"
+
+            if not success:
+                raise RuntimeError(f"RAR execution failed:\n{rar_log}")
+
+            stage = "Scanning for RAR Files"
+            generated_parts = find_rar_outputs(work_dir)
+            if not generated_parts:
+                dir_contents = os.listdir(work_dir)
+                raise FileNotFoundError(f"No RAR files found.\nDirectory contents: {dir_contents}")
+
+            if should_test:
+                stage = "Testing Archive Integrity (rar t)"
+                await status_msg.edit_text("Status: Running RAR integrity test (`rar t`)...")
+                test_passed, test_log = await run_rar_test(generated_parts[0])
+                extra_log += f"\n--- Test Log ---\n{test_log}"
+                if not test_passed:
+                    raise RuntimeError(f"RAR Integrity Test Failed (CRC mismatch or corruption):\n{test_log}")
+                await status_msg.edit_text("Status: RAR Integrity Test Passed (100% OK). Preparing upload...")
+                await asyncio.sleep(1)
+
+            stage = "Uploading Part(s)"
+            for idx, part in enumerate(generated_parts, 1):
+                part_state = {"last_update": 0}
+                await status_msg.edit_text(f"Uploading part {idx}/{len(generated_parts)}...")
+                await message.reply_document(
+                    document=part,
+                    caption=f"`{os.path.basename(part)}`",
+                    progress=progress_callback,
+                    progress_args=(status_msg, f"Uploading Part {idx}/{len(generated_parts)}", part_state)
+                )
+
+            await status_msg.delete()
+
+        except Exception as err:
+            await send_detailed_error(message, status_msg, stage, err, extra_log)
+        finally:
+            shutil.rmtree(work_dir, ignore_errors=True)
+
 @app.on_message(filters.command(["start", "help"]))
 async def start_handler(client: Client, message: Message):
     if not is_authorized(message.from_user.id):
@@ -199,74 +353,23 @@ async def file_handler(client: Client, message: Message):
         await message.reply("Access denied.")
         return
 
-    work_dir = os.path.join("/tmp", f"rar_{uuid.uuid4().hex}")
-    os.makedirs(work_dir, exist_ok=True)
-    status_msg = await message.reply("Task queued...")
-    stage = "Queue"
-    extra_log = ""
-
-    async with task_semaphore:
-        try:
-            stage = "Downloading from Telegram"
-            await status_msg.edit_text(f"Status: {stage}...")
-            state = {"last_update": 0}
-
-            file_attr = message.document or message.video or message.audio
-            orig_name = getattr(file_attr, "file_name", None) or "input_file"
-            orig_name = sanitize_filename(orig_name)
-            save_dest = os.path.join(work_dir, orig_name)
-
-            file_path = await message.download(
-                file_name=save_dest,
-                progress=progress_callback,
-                progress_args=(status_msg, stage, state)
-            )
-
-            base_name = sanitize_filename(os.path.splitext(orig_name)[0])
-            extract_dir = os.path.join(work_dir, f"{base_name}_extracted")
-
-            stage = "Extracting Archive"
-            extracted, ext_log = await extract_archive_if_needed(file_path, extract_dir)
-            extra_log += f"\n--- Extraction Log ---\n{ext_log}"
-
-            target = extract_dir if extracted else file_path
-
-            stage = "Compressing to RAR (-m5)"
-            rar_target = os.path.join(work_dir, f"{base_name}.rar")
-            await status_msg.edit_text(f"Status: {stage}...")
-            success, rar_log = await run_rar_compression(target, rar_target)
-            extra_log += f"\n--- RAR Log ---\n{rar_log}"
-
-            if not success:
-                raise RuntimeError(f"RAR exited with error status.\n{rar_log}")
-
-            stage = "Scanning for RAR Files"
-            generated_parts = find_rar_outputs(work_dir)
-
-            if not generated_parts:
-                dir_contents = os.listdir(work_dir)
-                raise FileNotFoundError(
-                    f"No RAR files found after compression.\n"
-                    f"Directory contents: {dir_contents}"
-                )
-
-            stage = "Uploading Part(s)"
-            for idx, part in enumerate(generated_parts, 1):
-                part_state = {"last_update": 0}
-                await status_msg.edit_text(f"Uploading part {idx}/{len(generated_parts)}...")
-                await message.reply_document(
-                    document=part,
-                    caption=f"`{os.path.basename(part)}`",
-                    progress=progress_callback,
-                    progress_args=(status_msg, f"Uploading Part {idx}/{len(generated_parts)}", part_state)
-                )
-
-            await status_msg.delete()
-
-        except Exception as err:
-            await send_detailed_error(message, status_msg, stage, err, extra_log)
-        finally:
-            shutil.rmtree(work_dir, ignore_errors=True)
+    task_id = uuid.uuid4().hex[:8]
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("بله (تست سلامت با rar t)", callback_data=f"test:yes:{task_id}"),
+            InlineKeyboardButton("خیر (بدون تست)", callback_data=f"test:no:{task_id}")
+        ]
+    ])
+    prompt = await message.reply(
+        "آیا می‌خواهید پس از اتمام فشرده‌سازی، تست سلامت آرشیو (`rar t`) اجرا شود؟",
+        reply_markup=keyboard
+    )
+    PENDING_TASKS[task_id] = {
+        "mode": "file",
+        "message": message,
+        "status_msg": prompt,
+        "user_id": user_id
+    }
 
 @app.on_message(filters.regex(r"https?://[^\s]+"))
 async def link_handler(client: Client, message: Message):
@@ -275,71 +378,42 @@ async def link_handler(client: Client, message: Message):
         await message.reply("Access denied.")
         return
 
-    url = message.text.strip()
-    work_dir = os.path.join("/tmp", f"rar_{uuid.uuid4().hex}")
-    os.makedirs(work_dir, exist_ok=True)
-    status_msg = await message.reply("Task queued...")
-    stage = "Queue"
-    extra_log = ""
+    task_id = uuid.uuid4().hex[:8]
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("بله (تست سلامت با rar t)", callback_data=f"test:yes:{task_id}"),
+            InlineKeyboardButton("خیر (بدون تست)", callback_data=f"test:no:{task_id}")
+        ]
+    ])
+    prompt = await message.reply(
+        "آیا می‌خواهید پس از اتمام فشرده‌سازی، تست سلامت آرشیو (`rar t`) اجرا شود؟",
+        reply_markup=keyboard
+    )
+    PENDING_TASKS[task_id] = {
+        "mode": "url",
+        "url": message.text.strip(),
+        "message": message,
+        "status_msg": prompt,
+        "user_id": user_id
+    }
 
-    async with task_semaphore:
-        try:
-            stage = "Downloading URL"
-            parsed = urlparse(url)
-            raw_filename = unquote(os.path.basename(parsed.path)) or "downloaded_file"
-            raw_filename = sanitize_filename(raw_filename)
-            file_path = os.path.join(work_dir, raw_filename)
+@app.on_callback_query(filters.regex(r"^test:(yes|no):([a-f0-9]+)$"))
+async def test_callback_handler(client: Client, callback_query: CallbackQuery):
+    action, task_id = callback_query.data.split(":")[1], callback_query.data.split(":")[2]
+    task_data = PENDING_TASKS.get(task_id)
 
-            await status_msg.edit_text(f"Status: {stage}...")
-            download_ok, dl_err = await download_stream_url(url, file_path, status_msg)
-            if not download_ok:
-                raise RuntimeError(f"URL download failed: {dl_err}")
+    if not task_data:
+        await callback_query.answer("این عملیات منقضی شده است.", show_alert=True)
+        return
 
-            base_name = sanitize_filename(os.path.splitext(raw_filename)[0])
-            extract_dir = os.path.join(work_dir, f"{base_name}_extracted")
+    if callback_query.from_user.id != task_data["user_id"]:
+        await callback_query.answer("تنها ارسال‌کننده درخواست مجاز به انتخاب است.", show_alert=True)
+        return
 
-            stage = "Extracting Archive"
-            extracted, ext_log = await extract_archive_if_needed(file_path, extract_dir)
-            extra_log += f"\n--- Extraction Log ---\n{ext_log}"
-
-            target = extract_dir if extracted else file_path
-
-            stage = "Compressing to RAR (-m5)"
-            rar_target = os.path.join(work_dir, f"{base_name}.rar")
-            await status_msg.edit_text(f"Status: {stage}...")
-            success, rar_log = await run_rar_compression(target, rar_target)
-            extra_log += f"\n--- RAR Log ---\n{rar_log}"
-
-            if not success:
-                raise RuntimeError(f"RAR exited with error status.\n{rar_log}")
-
-            stage = "Scanning for RAR Files"
-            generated_parts = find_rar_outputs(work_dir)
-
-            if not generated_parts:
-                dir_contents = os.listdir(work_dir)
-                raise FileNotFoundError(
-                    f"No RAR files found after compression.\n"
-                    f"Directory contents: {dir_contents}"
-                )
-
-            stage = "Uploading Part(s)"
-            for idx, part in enumerate(generated_parts, 1):
-                part_state = {"last_update": 0}
-                await status_msg.edit_text(f"Uploading part {idx}/{len(generated_parts)}...")
-                await message.reply_document(
-                    document=part,
-                    caption=f"`{os.path.basename(part)}`",
-                    progress=progress_callback,
-                    progress_args=(status_msg, f"Uploading Part {idx}/{len(generated_parts)}", part_state)
-                )
-
-            await status_msg.delete()
-
-        except Exception as err:
-            await send_detailed_error(message, status_msg, stage, err, extra_log)
-        finally:
-            shutil.rmtree(work_dir, ignore_errors=True)
+    await callback_query.answer()
+    should_test = (action == "yes")
+    await task_data["status_msg"].edit_text("Task added to queue...")
+    asyncio.create_task(process_task(task_id, should_test))
 
 async def start_web_health():
     app_web = web.Application()
