@@ -550,7 +550,7 @@ async def link_handler(client: Client, message: Message):
     )
     task_data["status_msg"] = prompt
 
-@app.on_message(filters.text & ~filters.command)
+@app.on_message(filters.text & ~filters.regex(r"^/"))
 async def text_input_handler(client: Client, message: Message):
     user_id = message.from_user.id if message.from_user else 0
     if user_id not in AWAITING_RENAME:
