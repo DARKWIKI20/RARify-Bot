@@ -145,9 +145,9 @@ async def update_compression_progress(percent: int, status_msg: Message, state: 
     filled = int(percent // 10)
     bar = "█" * filled + "░" * (10 - filled)
     text = (
-        f"**Status:** Compressing to RAR (-m5)\n"
+        f"**Status:** Compressing to RAR5 Solid (-m5)\n"
         f"[{bar}] {percent}%\n"
-        f"Mode: Best | Dict: 64MB\n"
+        f"Mode: Best | Solid: ON | Dict: 64MB\n"
         f"Elapsed: {format_time(elapsed)} | ETA: {eta_str}"
     )
     try:
@@ -187,40 +187,60 @@ async def send_detailed_error(message: Message, status_msg: Message, stage: str,
     except Exception as err:
         logger.error(f"Failed to deliver error report: {err}")
 
-async def extract_archive_if_needed(file_path: str, extract_to: str, task_id: str) -> tuple[bool, str]:
-    ext = os.path.splitext(file_path)[1].lower()
-    archive_exts = {".zip", ".7z", ".tar", ".gz", ".bz2", ".xz", ".rar"}
-    if ext in archive_exts or file_path.endswith(".tar.gz"):
-        os.makedirs(extract_to, exist_ok=True)
-        cmd = ["7z", "x", file_path, f"-o{extract_to}", "-y"]
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        if task_id in ACTIVE_TASKS:
-            ACTIVE_TASKS[task_id]["proc"] = proc
+async def try_extract_archive(file_path: str, extract_to: str, task_id: str) -> tuple[bool, str]:
+    # Test file integrity and archive validity regardless of file name or extension
+    test_proc = await asyncio.create_subprocess_exec(
+        "7z", "t", file_path,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE
+    )
+    if task_id in ACTIVE_TASKS:
+        ACTIVE_TASKS[task_id]["proc"] = test_proc
 
-        stdout, stderr = await proc.communicate()
-        out_log = stdout.decode(errors="ignore") + "\n" + stderr.decode(errors="ignore")
-        return (proc.returncode == 0), out_log
-    return False, ""
+    stdout, stderr = await test_proc.communicate()
+    if test_proc.returncode != 0:
+        return False, "File is not an archive or format not supported."
+
+    os.makedirs(extract_to, exist_ok=True)
+    extract_proc = await asyncio.create_subprocess_exec(
+        "7z", "x", file_path, f"-o{extract_to}", "-y",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE
+    )
+    if task_id in ACTIVE_TASKS:
+        ACTIVE_TASKS[task_id]["proc"] = extract_proc
+
+    ext_out, ext_err = await extract_proc.communicate()
+    out_log = ext_out.decode(errors="ignore") + "\n" + ext_err.decode(errors="ignore")
+    return (extract_proc.returncode == 0), out_log
 
 async def run_rar_compression(input_target: str, output_rar_archive: str, status_msg: Message, task_id: str) -> tuple[bool, str]:
     cmd = [
         "rar", "a",
+        "-ma5",
         "-m5",
+        "-s",
         "-md64m",
-        "-ep1",
         f"-v{SPLIT_SIZE}"
     ]
-    if os.path.isdir(input_target):
-        cmd.append("-r")
 
-    cmd.extend([output_rar_archive, input_target])
+    working_dir = None
+    if os.path.isdir(input_target):
+        working_dir = input_target
+        cmd.append("-r")
+        cmd.append(output_rar_archive)
+        entries = os.listdir(input_target)
+        if not entries:
+            return False, "Extraction directory is empty."
+        cmd.extend(entries)
+    else:
+        working_dir = os.path.dirname(input_target)
+        cmd.append(output_rar_archive)
+        cmd.append(os.path.basename(input_target))
 
     proc = await asyncio.create_subprocess_exec(
         *cmd,
+        cwd=working_dir,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE
     )
@@ -291,12 +311,12 @@ async def download_stream_url(url: str, dest_path: str, status_msg: Message, tas
                         await progress_callback(downloaded, total_size, status_msg, "Downloading Link", state, task_id)
             return True, ""
 
-def find_rar_outputs(work_dir: str) -> list[str]:
-    files = os.listdir(work_dir)
-    rar_files = [
-        os.path.join(work_dir, f) for f in files
-        if f.lower().endswith(".rar") or ".part" in f.lower()
-    ]
+def find_rar_outputs(search_dir: str) -> list[str]:
+    rar_files = []
+    for root, _, files in os.walk(search_dir):
+        for f in files:
+            if f.lower().endswith(".rar") or ".part" in f.lower():
+                rar_files.append(os.path.join(root, f))
     rar_files.sort()
     return rar_files
 
@@ -311,8 +331,9 @@ async def process_task(task_id: str, should_test: bool):
     url = task_data.get("url")
 
     work_dir = os.path.join("/tmp", f"rar_{uuid.uuid4().hex}")
+    output_dir = os.path.join(work_dir, "output")
     task_data["work_dir"] = work_dir
-    os.makedirs(work_dir, exist_ok=True)
+    os.makedirs(output_dir, exist_ok=True)
     stage = "Queue"
     extra_log = ""
 
@@ -327,7 +348,7 @@ async def process_task(task_id: str, should_test: bool):
                 state = {"start_time": time.time(), "last_update": 0}
 
                 file_attr = message.document or message.video or message.audio
-                orig_name = getattr(file_attr, "file_name", None) or "input_file"
+                orig_name = getattr(file_attr, "file_name", None) or "file"
                 orig_name = sanitize_filename(orig_name)
                 save_dest = os.path.join(work_dir, orig_name)
 
@@ -353,10 +374,10 @@ async def process_task(task_id: str, should_test: bool):
             if task_data.get("cancelled"):
                 raise asyncio.CancelledError()
 
-            extract_dir = os.path.join(work_dir, f"{base_name}_extracted")
-            stage = "Extracting Archive"
+            extract_dir = os.path.join(work_dir, "extracted")
+            stage = "Analyzing and Extracting Archive"
             await status_msg.edit_text(f"Status: {stage}...", reply_markup=get_cancel_markup(task_id))
-            extracted, ext_log = await extract_archive_if_needed(file_path, extract_dir, task_id)
+            extracted, ext_log = await try_extract_archive(file_path, extract_dir, task_id)
             extra_log += f"\n--- Extraction Log ---\n{ext_log}"
 
             target = extract_dir if extracted else file_path
@@ -364,8 +385,8 @@ async def process_task(task_id: str, should_test: bool):
             if task_data.get("cancelled"):
                 raise asyncio.CancelledError()
 
-            stage = "Compressing to RAR (-m5)"
-            rar_target = os.path.join(work_dir, f"{base_name}.rar")
+            stage = "Compressing to RAR5 Solid (-m5)"
+            rar_target = os.path.join(output_dir, f"{base_name}.rar")
             await status_msg.edit_text(f"Status: {stage} (0%)...", reply_markup=get_cancel_markup(task_id))
             success, rar_log = await run_rar_compression(target, rar_target, status_msg, task_id)
             extra_log += f"\n--- RAR Log ---\n{rar_log}"
@@ -377,10 +398,10 @@ async def process_task(task_id: str, should_test: bool):
                 raise asyncio.CancelledError()
 
             stage = "Scanning for RAR Files"
-            generated_parts = find_rar_outputs(work_dir)
+            generated_parts = find_rar_outputs(output_dir)
             if not generated_parts:
-                dir_contents = os.listdir(work_dir)
-                raise FileNotFoundError(f"No RAR files found.\nDirectory contents: {dir_contents}")
+                dir_contents = os.listdir(output_dir)
+                raise FileNotFoundError(f"No RAR files found in output.\nDirectory contents: {dir_contents}")
 
             if should_test:
                 stage = "Testing Archive Integrity (rar t)"
@@ -547,7 +568,7 @@ async def test_callback_handler(client: Client, callback_query: CallbackQuery):
     await callback_query.answer()
     should_test = (action == "yes")
     await task_data["status_msg"].edit_text("Task queued...", reply_markup=get_cancel_markup(task_id))
-    
+
     t = asyncio.create_task(process_task(task_id, should_test))
     task_data["async_task"] = t
 
