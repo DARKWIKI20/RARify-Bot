@@ -37,7 +37,6 @@ API_HASH = os.getenv("API_HASH", "").strip()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ALLOWED_USERS_RAW = os.getenv("ALLOWED_USERS", "")
 SPLIT_SIZE = os.getenv("SPLIT_SIZE", "1950m")
-GOFILE_TOKEN_ENV = os.getenv("GOFILE_TOKEN", "").strip()
 PORT = int(os.getenv("PORT", "8080"))
 
 ALLOWED_USERS = set()
@@ -89,22 +88,7 @@ def is_authorized(user_id: int) -> bool:
 
 def get_cancel_markup(task_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("Cancel", callback_data=f"cancel:{task_id}")]
-    ])
-
-def get_options_markup(task_id: str, custom_name: str = "") -> InlineKeyboardMarkup:
-    rename_btn_text = f"Rename: {custom_name}.rar" if custom_name else "Set Custom Name"
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("Start: Test (rar t)", callback_data=f"test:yes:{task_id}"),
-            InlineKeyboardButton("Start: Skip Test", callback_data=f"test:no:{task_id}")
-        ],
-        [
-            InlineKeyboardButton(rename_btn_text, callback_data=f"rename:{task_id}")
-        ],
-        [
-            InlineKeyboardButton("Cancel", callback_data=f"cancel:{task_id}")
-        ]
+        [InlineKeyboardButton("❌ Cancel", callback_data=f"cancel:{task_id}")]
     ])
 
 async def progress_callback(current, total, status_msg: Message, action_name: str, state: dict, task_id: str):
@@ -204,6 +188,7 @@ async def send_detailed_error(message: Message, status_msg: Message, stage: str,
         logger.error(f"Failed to deliver error report: {err}")
 
 async def try_extract_archive(file_path: str, extract_to: str, task_id: str) -> tuple[bool, str]:
+    # Test file integrity and archive validity regardless of file name or extension
     test_proc = await asyncio.create_subprocess_exec(
         "7z", "t", file_path,
         stdout=asyncio.subprocess.PIPE,
@@ -239,6 +224,7 @@ async def run_rar_compression(input_target: str, output_rar_archive: str, status
         f"-v{SPLIT_SIZE}"
     ]
 
+    working_dir = None
     if os.path.isdir(input_target):
         working_dir = input_target
         cmd.append("-r")
@@ -305,103 +291,15 @@ async def run_rar_test(rar_file: str, task_id: str) -> tuple[bool, str]:
     log = stdout.decode(errors="ignore") + "\n" + stderr.decode(errors="ignore")
     return (proc.returncode == 0), log
 
-async def get_gofile_guest_token(session: aiohttp.ClientSession) -> str:
-    try:
-        post_headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            "Accept": "application/json",
-            "Origin": "https://gofile.io",
-            "Referer": "https://gofile.io/",
-        }
-        async with session.post("https://api.gofile.io/accounts", headers=post_headers, json={}) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                if data.get("status") == "ok":
-                    return data.get("data", {}).get("token", "")
-    except Exception as e:
-        logger.warning(f"Gofile guest account creation failed: {e}")
-    return ""
-
-async def download_stream_url(url: str, dest_dir: str, status_msg: Message, task_id: str, custom_token: str = "") -> tuple[bool, str, str]:
+async def download_stream_url(url: str, dest_path: str, status_msg: Message, task_id: str) -> tuple[bool, str]:
     state = {"start_time": time.time(), "last_update": 0}
     timeout = aiohttp.ClientTimeout(total=7200)
-
-    base_headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "identity",
-        "DNT": "1",
-        "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124"',
-        "Sec-Ch-Ua-Mobile": "?0",
-        "Sec-Ch-Ua-Platform": '"Windows"',
-        "Sec-Fetch-Dest": "document",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "none",
-        "Upgrade-Insecure-Requests": "1"
-    }
-
-    async with aiohttp.ClientSession(timeout=timeout, headers=base_headers) as session:
-        target_url = url
-        req_headers = dict(base_headers)
-        cookies = {}
-
-        if "gofile.io" in url:
-            req_headers["Referer"] = "https://gofile.io/"
-            req_headers["Origin"] = "https://gofile.io"
-            req_headers["Sec-Fetch-Site"] = "cross-site"
-
-            token = custom_token or GOFILE_TOKEN_ENV
-            if not token:
-                token = await get_gofile_guest_token(session)
-
-            if token:
-                req_headers["Authorization"] = f"Bearer {token}"
-                req_headers["Cookie"] = f"accountToken={token}"
-                cookies["accountToken"] = token
-
-        async with session.get(target_url, headers=req_headers, cookies=cookies, allow_redirects=True) as resp:
-            redirect_target = str(resp.url).rstrip("/")
-            if redirect_target in ("https://gofile.io", "http://gofile.io"):
-                return False, "", (
-                    "Gofile authentication failed (Redirected to index).\n"
-                    "Provide your browser accountToken:\n"
-                    "`<URL> | <accountToken>`"
-                )
-
-            if resp.status == 403:
-                return False, "", (
-                    "HTTP Status 403: Forbidden\n"
-                    "Server IP is blocked by remote host/Cloudflare or requires authentication.\n"
-                    "For Gofile, send with your accountToken:\n"
-                    "`<URL> | <accountToken>`"
-                )
-
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.get(url, allow_redirects=True) as resp:
             if resp.status != 200:
-                return False, "", f"HTTP Status {resp.status}: {resp.reason}"
-
-            content_type = resp.headers.get("Content-Type", "").lower()
-            if "text/html" in content_type or "application/json" in content_type:
-                preview = (await resp.content.read(1024)).decode(errors="ignore")
-                return False, "", f"Server returned HTML/JSON instead of binary stream: {preview[:200]}"
-
-            final_name = ""
-            cd = resp.headers.get("Content-Disposition", "")
-            if cd:
-                cd_matches = re.findall(r'filename\*?=(?:UTF-8\'\')?["\']?([^"\';]+)["\']?', cd, flags=re.IGNORECASE)
-                if cd_matches:
-                    final_name = unquote(cd_matches[-1].strip())
-
-            if not final_name:
-                parsed = urlparse(str(resp.url))
-                final_name = unquote(os.path.basename(parsed.path)) or "downloaded_file"
-
-            final_name = sanitize_filename(final_name)
-            dest_path = os.path.join(dest_dir, final_name)
-
+                return False, f"HTTP Status {resp.status}: {resp.reason}"
             total_size = int(resp.headers.get("Content-Length", 0))
             downloaded = 0
-
             with open(dest_path, "wb") as f:
                 async for chunk in resp.content.iter_chunked(2 * 1024 * 1024):
                     task_info = ACTIVE_TASKS.get(task_id)
@@ -411,14 +309,7 @@ async def download_stream_url(url: str, dest_dir: str, status_msg: Message, task
                     downloaded += len(chunk)
                     if total_size > 0:
                         await progress_callback(downloaded, total_size, status_msg, "Downloading Link", state, task_id)
-
-            if os.path.getsize(dest_path) < 10240 and total_size == 0:
-                with open(dest_path, "r", errors="ignore") as f:
-                    data_preview = f.read(512)
-                if "<html" in data_preview.lower() or '{"status":' in data_preview:
-                    return False, dest_path, f"Remote server returned an error document: {data_preview[:200]}"
-
-            return True, dest_path, ""
+            return True, ""
 
 def find_rar_outputs(search_dir: str) -> list[str]:
     rar_files = []
@@ -438,8 +329,6 @@ async def process_task(task_id: str, should_test: bool):
     status_msg = task_data["status_msg"]
     mode = task_data["mode"]
     url = task_data.get("url")
-    custom_token = task_data.get("custom_token", "")
-    custom_name = task_data.get("custom_name", "")
 
     work_dir = os.path.join("/tmp", f"rar_{uuid.uuid4().hex}")
     output_dir = os.path.join(work_dir, "output")
@@ -468,16 +357,19 @@ async def process_task(task_id: str, should_test: bool):
                     progress=progress_callback,
                     progress_args=(status_msg, stage, state, task_id)
                 )
-                detected_name = os.path.splitext(orig_name)[0]
+                base_name = sanitize_filename(os.path.splitext(orig_name)[0])
             else:
                 stage = "Downloading URL"
-                await status_msg.edit_text(f"Status: {stage}...", reply_markup=get_cancel_markup(task_id))
-                download_ok, file_path, dl_err = await download_stream_url(url, work_dir, status_msg, task_id, custom_token)
-                if not download_ok:
-                    raise RuntimeError(f"URL download failed:\n{dl_err}")
-                detected_name = os.path.splitext(os.path.basename(file_path))[0]
+                parsed = urlparse(url)
+                raw_filename = unquote(os.path.basename(parsed.path)) or "downloaded_file"
+                raw_filename = sanitize_filename(raw_filename)
+                file_path = os.path.join(work_dir, raw_filename)
 
-            final_base_name = sanitize_filename(custom_name if custom_name else detected_name)
+                await status_msg.edit_text(f"Status: {stage}...", reply_markup=get_cancel_markup(task_id))
+                download_ok, dl_err = await download_stream_url(url, file_path, status_msg, task_id)
+                if not download_ok:
+                    raise RuntimeError(f"URL download failed: {dl_err}")
+                base_name = sanitize_filename(os.path.splitext(raw_filename)[0])
 
             if task_data.get("cancelled"):
                 raise asyncio.CancelledError()
@@ -494,7 +386,7 @@ async def process_task(task_id: str, should_test: bool):
                 raise asyncio.CancelledError()
 
             stage = "Compressing to RAR5 Solid (-m5)"
-            rar_target = os.path.join(output_dir, f"{final_base_name}.rar")
+            rar_target = os.path.join(output_dir, f"{base_name}.rar")
             await status_msg.edit_text(f"Status: {stage} (0%)...", reply_markup=get_cancel_markup(task_id))
             success, rar_log = await run_rar_compression(target, rar_target, status_msg, task_id)
             extra_log += f"\n--- RAR Log ---\n{rar_log}"
@@ -543,7 +435,7 @@ async def process_task(task_id: str, should_test: bool):
         except asyncio.CancelledError:
             logger.info(f"Task {task_id} successfully cancelled.")
             try:
-                await status_msg.edit_text("Task was cancelled by user.")
+                await status_msg.edit_text("❌ Task was cancelled by user.")
             except Exception:
                 pass
         except Exception as err:
@@ -557,14 +449,7 @@ async def start_handler(client: Client, message: Message):
     if not is_authorized(message.from_user.id):
         await message.reply("Access denied.")
         return
-    await message.reply(
-        "Send any file or direct download link to compress into RAR (Best -m5).\n\n"
-        "**Custom Naming:**\n"
-        "• Click 'Set Custom Name' button before starting.\n"
-        "• Caption the file with the target name.\n"
-        "• For URLs: `<URL> | <custom_name>`\n"
-        "• For Gofile: `<URL> | <accountToken> | <custom_name>`"
-    )
+    await message.reply("Send any file or direct download link to compress into RAR (Best -m5).")
 
 @app.on_message(filters.document | filters.video | filters.audio)
 async def file_handler(client: Client, message: Message):
@@ -574,106 +459,60 @@ async def file_handler(client: Client, message: Message):
         return
 
     task_id = uuid.uuid4().hex[:8]
-    custom_name = ""
-    if message.caption:
-        custom_name = sanitize_filename(os.path.splitext(message.caption.strip())[0])
-
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("Yes (Test with rar t)", callback_data=f"test:yes:{task_id}"),
+            InlineKeyboardButton("No (Skip test)", callback_data=f"test:no:{task_id}")
+        ],
+        [
+            InlineKeyboardButton("❌ Cancel", callback_data=f"cancel:{task_id}")
+        ]
+    ])
     prompt = await message.reply(
-        f"Ready to compress.\n• Target: `{custom_name or 'Default'}.rar`\n\nConfigure options:",
-        reply_markup=get_options_markup(task_id, custom_name)
+        "Do you want to run an archive integrity test (`rar t`) after compression finishes?",
+        reply_markup=keyboard
     )
     ACTIVE_TASKS[task_id] = {
         "mode": "file",
         "message": message,
         "status_msg": prompt,
         "user_id": user_id,
-        "custom_name": custom_name,
-        "waiting_for_name": False,
         "cancelled": False,
         "proc": None,
         "async_task": None
     }
 
-@app.on_message(filters.regex(r"^https?://[^\s]+"))
+@app.on_message(filters.regex(r"https?://[^\s]+"))
 async def link_handler(client: Client, message: Message):
     user_id = message.from_user.id if message.from_user else 0
     if not is_authorized(user_id):
         await message.reply("Access denied.")
         return
 
-    raw_text = message.text.strip()
-    parts = [p.strip() for p in raw_text.split("|")]
-    url = parts[0]
-    custom_token = ""
-    custom_name = ""
-
-    if len(parts) == 2:
-        if "gofile.io" in url and len(parts[1]) > 20 and " " not in parts[1]:
-            custom_token = parts[1]
-        else:
-            custom_name = sanitize_filename(os.path.splitext(parts[1])[0])
-    elif len(parts) >= 3:
-        custom_token = parts[1]
-        custom_name = sanitize_filename(os.path.splitext(parts[2])[0])
-
     task_id = uuid.uuid4().hex[:8]
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("Yes (Test with rar t)", callback_data=f"test:yes:{task_id}"),
+            InlineKeyboardButton("No (Skip test)", callback_data=f"test:no:{task_id}")
+        ],
+        [
+            InlineKeyboardButton("❌ Cancel", callback_data=f"cancel:{task_id}")
+        ]
+    ])
     prompt = await message.reply(
-        f"Ready to compress URL.\n• Target: `{custom_name or 'Default'}.rar`\n\nConfigure options:",
-        reply_markup=get_options_markup(task_id, custom_name)
+        "Do you want to run an archive integrity test (`rar t`) after compression finishes?",
+        reply_markup=keyboard
     )
     ACTIVE_TASKS[task_id] = {
         "mode": "url",
-        "url": url,
-        "custom_token": custom_token,
-        "custom_name": custom_name,
+        "url": message.text.strip(),
         "message": message,
         "status_msg": prompt,
         "user_id": user_id,
-        "waiting_for_name": False,
         "cancelled": False,
         "proc": None,
         "async_task": None
     }
-
-@app.on_message(filters.text & ~filters.command(["start", "help"]))
-async def text_input_handler(client: Client, message: Message):
-    user_id = message.from_user.id if message.from_user else 0
-    if not is_authorized(user_id):
-        return
-
-    for task_id, task_data in list(ACTIVE_TASKS.items()):
-        if task_data.get("user_id") == user_id and task_data.get("waiting_for_name"):
-            task_data["waiting_for_name"] = False
-            raw_input = message.text.strip()
-            new_name = sanitize_filename(os.path.splitext(raw_input)[0])
-            if new_name:
-                task_data["custom_name"] = new_name
-
-            await task_data["status_msg"].edit_text(
-                f"Ready to compress.\n• Target: `{task_data.get('custom_name')}.rar`\n\nConfigure options:",
-                reply_markup=get_options_markup(task_id, task_data.get("custom_name"))
-            )
-            return
-
-@app.on_callback_query(filters.regex(r"^rename:([a-f0-9]+)$"))
-async def rename_callback_handler(client: Client, callback_query: CallbackQuery):
-    task_id = callback_query.data.split(":")[1]
-    task_data = ACTIVE_TASKS.get(task_id)
-
-    if not task_data:
-        await callback_query.answer("Task expired or not found.", show_alert=True)
-        return
-
-    if callback_query.from_user.id != task_data["user_id"]:
-        await callback_query.answer("Unauthorized.", show_alert=True)
-        return
-
-    task_data["waiting_for_name"] = True
-    await callback_query.answer()
-    await task_data["status_msg"].edit_text(
-        "Send the new filename as a text message:",
-        reply_markup=get_cancel_markup(task_id)
-    )
 
 @app.on_callback_query(filters.regex(r"^cancel:([a-f0-9]+)$"))
 async def cancel_callback_handler(client: Client, callback_query: CallbackQuery):
@@ -707,7 +546,7 @@ async def cancel_callback_handler(client: Client, callback_query: CallbackQuery)
         shutil.rmtree(work_dir, ignore_errors=True)
 
     try:
-        await task_data["status_msg"].edit_text("Task was cancelled by user.")
+        await task_data["status_msg"].edit_text("❌ Task was cancelled by user.")
     except Exception:
         pass
 
@@ -726,7 +565,6 @@ async def test_callback_handler(client: Client, callback_query: CallbackQuery):
         await callback_query.answer("Unauthorized.", show_alert=True)
         return
 
-    task_data["waiting_for_name"] = False
     await callback_query.answer()
     should_test = (action == "yes")
     await task_data["status_msg"].edit_text("Task queued...", reply_markup=get_cancel_markup(task_id))
