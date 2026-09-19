@@ -310,15 +310,16 @@ async def download_stream_url(url: str, dest_dir: str, status_msg: Message, task
         "Accept-Encoding": "identity",
         "Referer": "https://gofile.io/",
     }
+    cookies = {}
 
-    async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+    async with aiohttp.ClientSession(timeout=timeout) as session:
         if "gofile.io" in url:
             gofile_token = await get_gofile_token(session)
             if gofile_token:
-                session.cookie_jar.update_cookies({"accountToken": gofile_token}, url=urlparse(url))
+                cookies["accountToken"] = gofile_token
                 headers["Authorization"] = f"Bearer {gofile_token}"
 
-        async with session.get(url, headers=headers, allow_redirects=True) as resp:
+        async with session.get(url, headers=headers, cookies=cookies, allow_redirects=True) as resp:
             if resp.status != 200:
                 return False, "", f"HTTP Status {resp.status}: {resp.reason}"
 
