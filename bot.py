@@ -37,6 +37,7 @@ API_HASH = os.getenv("API_HASH", "").strip()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ALLOWED_USERS_RAW = os.getenv("ALLOWED_USERS", "")
 SPLIT_SIZE = os.getenv("SPLIT_SIZE", "1950m")
+GOFILE_TOKEN_ENV = os.getenv("GOFILE_TOKEN", "").strip()
 PORT = int(os.getenv("PORT", "8080"))
 
 ALLOWED_USERS = set()
@@ -289,79 +290,74 @@ async def run_rar_test(rar_file: str, task_id: str) -> tuple[bool, str]:
     log = stdout.decode(errors="ignore") + "\n" + stderr.decode(errors="ignore")
     return (proc.returncode == 0), log
 
-async def get_gofile_token(session: aiohttp.ClientSession) -> str:
+async def get_gofile_guest_token(session: aiohttp.ClientSession) -> str:
     try:
-        async with session.post("https://api.gofile.io/accounts") as resp:
+        post_headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Accept": "application/json, text/plain, */*",
+            "Origin": "https://gofile.io",
+            "Referer": "https://gofile.io/",
+        }
+        async with session.post("https://api.gofile.io/accounts", headers=post_headers, json={}) as resp:
             if resp.status == 200:
                 data = await resp.json()
                 if data.get("status") == "ok":
-                    return data["data"]["token"]
+                    return data.get("data", {}).get("token", "")
     except Exception as e:
-        logger.warning(f"Failed to obtain Gofile guest token: {e}")
+        logger.warning(f"Gofile guest account creation failed: {e}")
     return ""
 
-async def resolve_gofile_url(url: str, session: aiohttp.ClientSession) -> tuple[str, str]:
-    token = await get_gofile_token(session)
-    if not token:
-        return url, ""
-
-    match = re.search(r"(?:gofile\.io/(?:d/|download/web/)|contents/)([a-zA-Z0-9-]+)", url)
-    if not match:
-        return url, token
-
-    content_id = match.group(1)
-    api_url = f"https://api.gofile.io/contents/{content_id}"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Authorization": f"Bearer {token}"
-    }
-
-    try:
-        async with session.get(api_url, headers=headers) as resp:
-            if resp.status == 200:
-                res_data = await resp.json()
-                if res_data.get("status") == "ok":
-                    d = res_data.get("data", {})
-                    if d.get("type") == "file" and d.get("link"):
-                        return d["link"], token
-                    elif d.get("type") == "folder":
-                        children = d.get("children", {})
-                        for item in children.values():
-                            if item.get("link"):
-                                return item["link"], token
-    except Exception as e:
-        logger.warning(f"Gofile API resolution failed: {e}")
-
-    return url, token
-
-async def download_stream_url(url: str, dest_dir: str, status_msg: Message, task_id: str) -> tuple[bool, str, str]:
+async def download_stream_url(url: str, dest_dir: str, status_msg: Message, task_id: str, custom_token: str = "") -> tuple[bool, str, str]:
     state = {"start_time": time.time(), "last_update": 0}
     timeout = aiohttp.ClientTimeout(total=7200)
 
-    headers = {
+    base_headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         "Accept": "*/*",
         "Accept-Encoding": "identity",
         "Referer": "https://gofile.io/",
+        "Origin": "https://gofile.io"
     }
-    cookies = {}
 
-    async with aiohttp.ClientSession(timeout=timeout) as session:
+    async with aiohttp.ClientSession(timeout=timeout, headers=base_headers) as session:
         target_url = url
-        if "gofile.io" in url:
-            target_url, gofile_token = await resolve_gofile_url(url, session)
-            if gofile_token:
-                headers["Authorization"] = f"Bearer {gofile_token}"
-                cookies["accountToken"] = gofile_token
+        req_headers = dict(base_headers)
+        cookies = {}
 
-        async with session.get(target_url, headers=headers, cookies=cookies, allow_redirects=True) as resp:
+        if "gofile.io" in url:
+            token = custom_token or GOFILE_TOKEN_ENV
+            if not token:
+                token = await get_gofile_guest_token(session)
+
+            if token:
+                req_headers["Authorization"] = f"Bearer {token}"
+                req_headers["Cookie"] = f"accountToken={token}"
+                cookies["accountToken"] = token
+            else:
+                return False, "", (
+                    "Could not generate a Gofile guest token from server IP.\n"
+                    "Please provide your personal token:\n"
+                    "1) Send as: `<URL> | <token>`\n"
+                    "2) Or set `GOFILE_TOKEN` in Railway Variables."
+                )
+
+        async with session.get(target_url, headers=req_headers, cookies=cookies, allow_redirects=True) as resp:
+            redirect_target = str(resp.url).rstrip("/")
+            if redirect_target in ("https://gofile.io", "http://gofile.io"):
+                return False, "", (
+                    "Gofile authentication failed (Server redirected to homepage).\n"
+                    "The provided or auto-generated token was rejected by Gofile.\n"
+                    "Provide your browser accountToken:\n"
+                    "`<URL> | <accountToken>`"
+                )
+
             if resp.status != 200:
                 return False, "", f"HTTP Status {resp.status}: {resp.reason}"
 
             content_type = resp.headers.get("Content-Type", "").lower()
             if "text/html" in content_type or "application/json" in content_type:
-                preview = (await resp.content.read(2048)).decode(errors="ignore")
-                return False, "", f"Server returned {content_type} instead of binary data. Content: {preview[:300]}"
+                preview = (await resp.content.read(1024)).decode(errors="ignore")
+                return False, "", f"Server returned HTML/JSON instead of file stream: {preview[:200]}"
 
             final_name = ""
             cd = resp.headers.get("Content-Disposition", "")
@@ -394,7 +390,7 @@ async def download_stream_url(url: str, dest_dir: str, status_msg: Message, task
                 with open(dest_path, "r", errors="ignore") as f:
                     data_preview = f.read(512)
                 if "<html" in data_preview.lower() or '{"status":' in data_preview:
-                    return False, dest_path, f"Remote server provided an error page: {data_preview[:200]}"
+                    return False, dest_path, f"Remote server returned an error document: {data_preview[:200]}"
 
             return True, dest_path, ""
 
@@ -416,6 +412,7 @@ async def process_task(task_id: str, should_test: bool):
     status_msg = task_data["status_msg"]
     mode = task_data["mode"]
     url = task_data.get("url")
+    custom_token = task_data.get("custom_token", "")
 
     work_dir = os.path.join("/tmp", f"rar_{uuid.uuid4().hex}")
     output_dir = os.path.join(work_dir, "output")
@@ -448,9 +445,9 @@ async def process_task(task_id: str, should_test: bool):
             else:
                 stage = "Downloading URL"
                 await status_msg.edit_text(f"Status: {stage}...", reply_markup=get_cancel_markup(task_id))
-                download_ok, file_path, dl_err = await download_stream_url(url, work_dir, status_msg, task_id)
+                download_ok, file_path, dl_err = await download_stream_url(url, work_dir, status_msg, task_id, custom_token)
                 if not download_ok:
-                    raise RuntimeError(f"URL download failed: {dl_err}")
+                    raise RuntimeError(f"URL download failed:\n{dl_err}")
                 base_name = sanitize_filename(os.path.splitext(os.path.basename(file_path))[0])
 
             if task_data.get("cancelled"):
@@ -531,7 +528,12 @@ async def start_handler(client: Client, message: Message):
     if not is_authorized(message.from_user.id):
         await message.reply("Access denied.")
         return
-    await message.reply("Send any file or direct download link to compress into RAR (Best -m5).")
+    await message.reply(
+        "Send any file or direct download link to compress into RAR (Best -m5).\n\n"
+        "**For Gofile links:**\n"
+        "You can send: `<URL>`\n"
+        "Or if requested: `<URL> | <accountToken>`"
+    )
 
 @app.on_message(filters.document | filters.video | filters.audio)
 async def file_handler(client: Client, message: Message):
@@ -571,6 +573,15 @@ async def link_handler(client: Client, message: Message):
         await message.reply("Access denied.")
         return
 
+    raw_text = message.text.strip()
+    custom_token = ""
+    if "|" in raw_text:
+        parts = raw_text.split("|", 1)
+        url = parts[0].strip()
+        custom_token = parts[1].strip()
+    else:
+        url = raw_text
+
     task_id = uuid.uuid4().hex[:8]
     keyboard = InlineKeyboardMarkup([
         [
@@ -587,7 +598,8 @@ async def link_handler(client: Client, message: Message):
     )
     ACTIVE_TASKS[task_id] = {
         "mode": "url",
-        "url": message.text.strip(),
+        "url": url,
+        "custom_token": custom_token,
         "message": message,
         "status_msg": prompt,
         "user_id": user_id,
