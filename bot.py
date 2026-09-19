@@ -51,7 +51,7 @@ if not API_HASH or not BOT_TOKEN:
     sys.exit(1)
 
 task_semaphore = asyncio.Semaphore(1)
-PENDING_TASKS = {}
+ACTIVE_TASKS = {}
 
 app = Client(
     "rar_worker_bot",
@@ -86,7 +86,16 @@ def is_authorized(user_id: int) -> bool:
         return True
     return user_id in ALLOWED_USERS
 
-async def progress_callback(current, total, status_msg: Message, action_name: str, state: dict):
+def get_cancel_markup(task_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("❌ Cancel", callback_data=f"cancel:{task_id}")]
+    ])
+
+async def progress_callback(current, total, status_msg: Message, action_name: str, state: dict, task_id: str):
+    task_info = ACTIVE_TASKS.get(task_id)
+    if task_info and task_info.get("cancelled"):
+        raise asyncio.CancelledError("Task was cancelled by user.")
+
     now = time.time()
     if now - state.get("last_update", 0) < 4 and current != total:
         return
@@ -107,13 +116,17 @@ async def progress_callback(current, total, status_msg: Message, action_name: st
         f"Speed: {human_size(int(speed))}/s | ETA: {format_time(eta)}"
     )
     try:
-        await status_msg.edit_text(text)
+        await status_msg.edit_text(text, reply_markup=get_cancel_markup(task_id))
     except FloodWait as e:
         await asyncio.sleep(e.value)
     except Exception:
         pass
 
-async def update_compression_progress(percent: int, status_msg: Message, state: dict):
+async def update_compression_progress(percent: int, status_msg: Message, state: dict, task_id: str):
+    task_info = ACTIVE_TASKS.get(task_id)
+    if task_info and task_info.get("cancelled"):
+        raise asyncio.CancelledError("Task was cancelled by user.")
+
     now = time.time()
     if now - state.get("last_update", 0) < 4 and percent < 100:
         return
@@ -134,11 +147,11 @@ async def update_compression_progress(percent: int, status_msg: Message, state: 
     text = (
         f"**Status:** Compressing to RAR (-m5)\n"
         f"[{bar}] {percent}%\n"
-        f"Mode: Best | Dict: 64MB | RR: 5%\n"
+        f"Mode: Best | Dict: 64MB\n"
         f"Elapsed: {format_time(elapsed)} | ETA: {eta_str}"
     )
     try:
-        await status_msg.edit_text(text)
+        await status_msg.edit_text(text, reply_markup=get_cancel_markup(task_id))
     except FloodWait as e:
         await asyncio.sleep(e.value)
     except Exception:
@@ -174,7 +187,7 @@ async def send_detailed_error(message: Message, status_msg: Message, stage: str,
     except Exception as err:
         logger.error(f"Failed to deliver error report: {err}")
 
-async def extract_archive_if_needed(file_path: str, extract_to: str) -> tuple[bool, str]:
+async def extract_archive_if_needed(file_path: str, extract_to: str, task_id: str) -> tuple[bool, str]:
     ext = os.path.splitext(file_path)[1].lower()
     archive_exts = {".zip", ".7z", ".tar", ".gz", ".bz2", ".xz", ".rar"}
     if ext in archive_exts or file_path.endswith(".tar.gz"):
@@ -185,17 +198,19 @@ async def extract_archive_if_needed(file_path: str, extract_to: str) -> tuple[bo
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
+        if task_id in ACTIVE_TASKS:
+            ACTIVE_TASKS[task_id]["proc"] = proc
+
         stdout, stderr = await proc.communicate()
         out_log = stdout.decode(errors="ignore") + "\n" + stderr.decode(errors="ignore")
         return (proc.returncode == 0), out_log
     return False, ""
 
-async def run_rar_compression(input_target: str, output_rar_archive: str, status_msg: Message) -> tuple[bool, str]:
+async def run_rar_compression(input_target: str, output_rar_archive: str, status_msg: Message, task_id: str) -> tuple[bool, str]:
     cmd = [
         "rar", "a",
         "-m5",
         "-md64m",
-        "-rr5p",
         "-ep1",
         f"-v{SPLIT_SIZE}"
     ]
@@ -209,12 +224,19 @@ async def run_rar_compression(input_target: str, output_rar_archive: str, status
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE
     )
+    if task_id in ACTIVE_TASKS:
+        ACTIVE_TASKS[task_id]["proc"] = proc
 
     full_log = []
     buf = ""
     state = {"start_time": time.time(), "last_update": 0}
 
     while True:
+        task_info = ACTIVE_TASKS.get(task_id)
+        if task_info and task_info.get("cancelled"):
+            proc.kill()
+            raise asyncio.CancelledError("Task was cancelled by user.")
+
         chunk = await proc.stdout.read(64)
         if not chunk:
             break
@@ -226,7 +248,7 @@ async def run_rar_compression(input_target: str, output_rar_archive: str, status
         if matches:
             percent = int(matches[-1])
             if 0 <= percent <= 100:
-                await update_compression_progress(percent, status_msg, state)
+                await update_compression_progress(percent, status_msg, state, task_id)
 
         if len(buf) > 256:
             buf = buf[-64:]
@@ -235,18 +257,21 @@ async def run_rar_compression(input_target: str, output_rar_archive: str, status
     full_log.append(stderr_data.decode(errors="ignore"))
     return (proc.returncode == 0), "".join(full_log)
 
-async def run_rar_test(rar_file: str) -> tuple[bool, str]:
+async def run_rar_test(rar_file: str, task_id: str) -> tuple[bool, str]:
     cmd = ["rar", "t", "-y", rar_file]
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE
     )
+    if task_id in ACTIVE_TASKS:
+        ACTIVE_TASKS[task_id]["proc"] = proc
+
     stdout, stderr = await proc.communicate()
     log = stdout.decode(errors="ignore") + "\n" + stderr.decode(errors="ignore")
     return (proc.returncode == 0), log
 
-async def download_stream_url(url: str, dest_path: str, status_msg: Message) -> tuple[bool, str]:
+async def download_stream_url(url: str, dest_path: str, status_msg: Message, task_id: str) -> tuple[bool, str]:
     state = {"start_time": time.time(), "last_update": 0}
     timeout = aiohttp.ClientTimeout(total=7200)
     async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -257,10 +282,13 @@ async def download_stream_url(url: str, dest_path: str, status_msg: Message) -> 
             downloaded = 0
             with open(dest_path, "wb") as f:
                 async for chunk in resp.content.iter_chunked(2 * 1024 * 1024):
+                    task_info = ACTIVE_TASKS.get(task_id)
+                    if task_info and task_info.get("cancelled"):
+                        raise asyncio.CancelledError("Task was cancelled by user.")
                     f.write(chunk)
                     downloaded += len(chunk)
                     if total_size > 0:
-                        await progress_callback(downloaded, total_size, status_msg, "Downloading Link", state)
+                        await progress_callback(downloaded, total_size, status_msg, "Downloading Link", state, task_id)
             return True, ""
 
 def find_rar_outputs(work_dir: str) -> list[str]:
@@ -273,7 +301,7 @@ def find_rar_outputs(work_dir: str) -> list[str]:
     return rar_files
 
 async def process_task(task_id: str, should_test: bool):
-    task_data = PENDING_TASKS.pop(task_id, None)
+    task_data = ACTIVE_TASKS.get(task_id)
     if not task_data:
         return
 
@@ -283,15 +311,19 @@ async def process_task(task_id: str, should_test: bool):
     url = task_data.get("url")
 
     work_dir = os.path.join("/tmp", f"rar_{uuid.uuid4().hex}")
+    task_data["work_dir"] = work_dir
     os.makedirs(work_dir, exist_ok=True)
     stage = "Queue"
     extra_log = ""
 
     async with task_semaphore:
         try:
+            if task_data.get("cancelled"):
+                raise asyncio.CancelledError()
+
             if mode == "file":
                 stage = "Downloading from Telegram"
-                await status_msg.edit_text(f"Status: {stage}...")
+                await status_msg.edit_text(f"Status: {stage}...", reply_markup=get_cancel_markup(task_id))
                 state = {"start_time": time.time(), "last_update": 0}
 
                 file_attr = message.document or message.video or message.audio
@@ -302,7 +334,7 @@ async def process_task(task_id: str, should_test: bool):
                 file_path = await message.download(
                     file_name=save_dest,
                     progress=progress_callback,
-                    progress_args=(status_msg, stage, state)
+                    progress_args=(status_msg, stage, state, task_id)
                 )
                 base_name = sanitize_filename(os.path.splitext(orig_name)[0])
             else:
@@ -312,27 +344,37 @@ async def process_task(task_id: str, should_test: bool):
                 raw_filename = sanitize_filename(raw_filename)
                 file_path = os.path.join(work_dir, raw_filename)
 
-                await status_msg.edit_text(f"Status: {stage}...")
-                download_ok, dl_err = await download_stream_url(url, file_path, status_msg)
+                await status_msg.edit_text(f"Status: {stage}...", reply_markup=get_cancel_markup(task_id))
+                download_ok, dl_err = await download_stream_url(url, file_path, status_msg, task_id)
                 if not download_ok:
                     raise RuntimeError(f"URL download failed: {dl_err}")
                 base_name = sanitize_filename(os.path.splitext(raw_filename)[0])
 
+            if task_data.get("cancelled"):
+                raise asyncio.CancelledError()
+
             extract_dir = os.path.join(work_dir, f"{base_name}_extracted")
             stage = "Extracting Archive"
-            extracted, ext_log = await extract_archive_if_needed(file_path, extract_dir)
+            await status_msg.edit_text(f"Status: {stage}...", reply_markup=get_cancel_markup(task_id))
+            extracted, ext_log = await extract_archive_if_needed(file_path, extract_dir, task_id)
             extra_log += f"\n--- Extraction Log ---\n{ext_log}"
 
             target = extract_dir if extracted else file_path
 
+            if task_data.get("cancelled"):
+                raise asyncio.CancelledError()
+
             stage = "Compressing to RAR (-m5)"
             rar_target = os.path.join(work_dir, f"{base_name}.rar")
-            await status_msg.edit_text(f"Status: {stage} (0%)...")
-            success, rar_log = await run_rar_compression(target, rar_target, status_msg)
+            await status_msg.edit_text(f"Status: {stage} (0%)...", reply_markup=get_cancel_markup(task_id))
+            success, rar_log = await run_rar_compression(target, rar_target, status_msg, task_id)
             extra_log += f"\n--- RAR Log ---\n{rar_log}"
 
             if not success:
                 raise RuntimeError(f"RAR execution failed:\n{rar_log}")
+
+            if task_data.get("cancelled"):
+                raise asyncio.CancelledError()
 
             stage = "Scanning for RAR Files"
             generated_parts = find_rar_outputs(work_dir)
@@ -342,31 +384,44 @@ async def process_task(task_id: str, should_test: bool):
 
             if should_test:
                 stage = "Testing Archive Integrity (rar t)"
-                await status_msg.edit_text("Status: Running RAR integrity test (`rar t`)...")
-                test_passed, test_log = await run_rar_test(generated_parts[0])
+                await status_msg.edit_text("Status: Running RAR integrity test (`rar t`)...", reply_markup=get_cancel_markup(task_id))
+                test_passed, test_log = await run_rar_test(generated_parts[0], task_id)
                 extra_log += f"\n--- Test Log ---\n{test_log}"
                 if not test_passed:
                     raise RuntimeError(f"RAR Integrity Test Failed:\n{test_log}")
-                await status_msg.edit_text("Status: RAR Integrity Test Passed (100% OK). Preparing upload...")
+                await status_msg.edit_text("Status: RAR Integrity Test Passed (100% OK). Preparing upload...", reply_markup=get_cancel_markup(task_id))
                 await asyncio.sleep(1)
+
+            if task_data.get("cancelled"):
+                raise asyncio.CancelledError()
 
             stage = "Uploading Part(s)"
             for idx, part in enumerate(generated_parts, 1):
+                if task_data.get("cancelled"):
+                    raise asyncio.CancelledError()
+
                 part_state = {"start_time": time.time(), "last_update": 0}
-                await status_msg.edit_text(f"Uploading part {idx}/{len(generated_parts)}...")
+                await status_msg.edit_text(f"Uploading part {idx}/{len(generated_parts)}...", reply_markup=get_cancel_markup(task_id))
                 await message.reply_document(
                     document=part,
                     caption=f"`{os.path.basename(part)}`",
                     progress=progress_callback,
-                    progress_args=(status_msg, f"Uploading Part {idx}/{len(generated_parts)}", part_state)
+                    progress_args=(status_msg, f"Uploading Part {idx}/{len(generated_parts)}", part_state, task_id)
                 )
 
             await status_msg.delete()
 
+        except asyncio.CancelledError:
+            logger.info(f"Task {task_id} successfully cancelled.")
+            try:
+                await status_msg.edit_text("❌ Task was cancelled by user.")
+            except Exception:
+                pass
         except Exception as err:
             await send_detailed_error(message, status_msg, stage, err, extra_log)
         finally:
             shutil.rmtree(work_dir, ignore_errors=True)
+            ACTIVE_TASKS.pop(task_id, None)
 
 @app.on_message(filters.command(["start", "help"]))
 async def start_handler(client: Client, message: Message):
@@ -387,17 +442,23 @@ async def file_handler(client: Client, message: Message):
         [
             InlineKeyboardButton("Yes (Test with rar t)", callback_data=f"test:yes:{task_id}"),
             InlineKeyboardButton("No (Skip test)", callback_data=f"test:no:{task_id}")
+        ],
+        [
+            InlineKeyboardButton("❌ Cancel", callback_data=f"cancel:{task_id}")
         ]
     ])
     prompt = await message.reply(
         "Do you want to run an archive integrity test (`rar t`) after compression finishes?",
         reply_markup=keyboard
     )
-    PENDING_TASKS[task_id] = {
+    ACTIVE_TASKS[task_id] = {
         "mode": "file",
         "message": message,
         "status_msg": prompt,
-        "user_id": user_id
+        "user_id": user_id,
+        "cancelled": False,
+        "proc": None,
+        "async_task": None
     }
 
 @app.on_message(filters.regex(r"https?://[^\s]+"))
@@ -412,24 +473,68 @@ async def link_handler(client: Client, message: Message):
         [
             InlineKeyboardButton("Yes (Test with rar t)", callback_data=f"test:yes:{task_id}"),
             InlineKeyboardButton("No (Skip test)", callback_data=f"test:no:{task_id}")
+        ],
+        [
+            InlineKeyboardButton("❌ Cancel", callback_data=f"cancel:{task_id}")
         ]
     ])
     prompt = await message.reply(
         "Do you want to run an archive integrity test (`rar t`) after compression finishes?",
         reply_markup=keyboard
     )
-    PENDING_TASKS[task_id] = {
+    ACTIVE_TASKS[task_id] = {
         "mode": "url",
         "url": message.text.strip(),
         "message": message,
         "status_msg": prompt,
-        "user_id": user_id
+        "user_id": user_id,
+        "cancelled": False,
+        "proc": None,
+        "async_task": None
     }
+
+@app.on_callback_query(filters.regex(r"^cancel:([a-f0-9]+)$"))
+async def cancel_callback_handler(client: Client, callback_query: CallbackQuery):
+    task_id = callback_query.data.split(":")[1]
+    task_data = ACTIVE_TASKS.get(task_id)
+
+    if not task_data:
+        await callback_query.answer("Task expired or already finished.", show_alert=True)
+        return
+
+    if callback_query.from_user.id != task_data["user_id"]:
+        await callback_query.answer("Unauthorized.", show_alert=True)
+        return
+
+    await callback_query.answer("Cancelling task...")
+    task_data["cancelled"] = True
+
+    proc = task_data.get("proc")
+    if proc:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+    async_task = task_data.get("async_task")
+    if async_task and not async_task.done():
+        async_task.cancel()
+
+    work_dir = task_data.get("work_dir")
+    if work_dir and os.path.exists(work_dir):
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+    try:
+        await task_data["status_msg"].edit_text("❌ Task was cancelled by user.")
+    except Exception:
+        pass
+
+    ACTIVE_TASKS.pop(task_id, None)
 
 @app.on_callback_query(filters.regex(r"^test:(yes|no):([a-f0-9]+)$"))
 async def test_callback_handler(client: Client, callback_query: CallbackQuery):
     action, task_id = callback_query.data.split(":")[1], callback_query.data.split(":")[2]
-    task_data = PENDING_TASKS.get(task_id)
+    task_data = ACTIVE_TASKS.get(task_id)
 
     if not task_data:
         await callback_query.answer("Task expired or not found.", show_alert=True)
@@ -441,8 +546,10 @@ async def test_callback_handler(client: Client, callback_query: CallbackQuery):
 
     await callback_query.answer()
     should_test = (action == "yes")
-    await task_data["status_msg"].edit_text("Task queued...")
-    asyncio.create_task(process_task(task_id, should_test))
+    await task_data["status_msg"].edit_text("Task queued...", reply_markup=get_cancel_markup(task_id))
+    
+    t = asyncio.create_task(process_task(task_id, should_test))
+    task_data["async_task"] = t
 
 async def start_web_health():
     app_web = web.Application()
