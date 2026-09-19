@@ -52,6 +52,7 @@ if not API_HASH or not BOT_TOKEN:
 
 task_semaphore = asyncio.Semaphore(1)
 ACTIVE_TASKS = {}
+AWAITING_RENAME = {}
 
 app = Client(
     "rar_worker_bot",
@@ -88,8 +89,29 @@ def is_authorized(user_id: int) -> bool:
 
 def get_cancel_markup(task_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("❌ Cancel", callback_data=f"cancel:{task_id}")]
+        [InlineKeyboardButton("Cancel", callback_data=f"cancel:{task_id}")]
     ])
+
+def get_setup_markup(task_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("Yes (Test with rar t)", callback_data=f"test:yes:{task_id}"),
+            InlineKeyboardButton("No (Skip test)", callback_data=f"test:no:{task_id}")
+        ],
+        [
+            InlineKeyboardButton("Set Custom Name", callback_data=f"rename:{task_id}")
+        ],
+        [
+            InlineKeyboardButton("Cancel", callback_data=f"cancel:{task_id}")
+        ]
+    ])
+
+def get_setup_text(task_data: dict) -> str:
+    name = task_data.get("custom_name") or task_data.get("default_name")
+    return (
+        f"**Target Archive:** `{name}.rar`\n\n"
+        "Do you want to run an archive integrity test (`rar t`) after compression finishes?"
+    )
 
 async def progress_callback(current, total, status_msg: Message, action_name: str, state: dict, task_id: str):
     task_info = ACTIVE_TASKS.get(task_id)
@@ -188,7 +210,6 @@ async def send_detailed_error(message: Message, status_msg: Message, stage: str,
         logger.error(f"Failed to deliver error report: {err}")
 
 async def try_extract_archive(file_path: str, extract_to: str, task_id: str) -> tuple[bool, str]:
-    # Test file integrity and archive validity regardless of file name or extension
     test_proc = await asyncio.create_subprocess_exec(
         "7z", "t", file_path,
         stdout=asyncio.subprocess.PIPE,
@@ -224,7 +245,6 @@ async def run_rar_compression(input_target: str, output_rar_archive: str, status
         f"-v{SPLIT_SIZE}"
     ]
 
-    working_dir = None
     if os.path.isdir(input_target):
         working_dir = input_target
         cmd.append("-r")
@@ -357,7 +377,6 @@ async def process_task(task_id: str, should_test: bool):
                     progress=progress_callback,
                     progress_args=(status_msg, stage, state, task_id)
                 )
-                base_name = sanitize_filename(os.path.splitext(orig_name)[0])
             else:
                 stage = "Downloading URL"
                 parsed = urlparse(url)
@@ -369,7 +388,6 @@ async def process_task(task_id: str, should_test: bool):
                 download_ok, dl_err = await download_stream_url(url, file_path, status_msg, task_id)
                 if not download_ok:
                     raise RuntimeError(f"URL download failed: {dl_err}")
-                base_name = sanitize_filename(os.path.splitext(raw_filename)[0])
 
             if task_data.get("cancelled"):
                 raise asyncio.CancelledError()
@@ -386,7 +404,8 @@ async def process_task(task_id: str, should_test: bool):
                 raise asyncio.CancelledError()
 
             stage = "Compressing to RAR5 Solid (-m5)"
-            rar_target = os.path.join(output_dir, f"{base_name}.rar")
+            final_name = task_data.get("custom_name") or task_data.get("default_name")
+            rar_target = os.path.join(output_dir, f"{final_name}.rar")
             await status_msg.edit_text(f"Status: {stage} (0%)...", reply_markup=get_cancel_markup(task_id))
             success, rar_log = await run_rar_compression(target, rar_target, status_msg, task_id)
             extra_log += f"\n--- RAR Log ---\n{rar_log}"
@@ -435,7 +454,7 @@ async def process_task(task_id: str, should_test: bool):
         except asyncio.CancelledError:
             logger.info(f"Task {task_id} successfully cancelled.")
             try:
-                await status_msg.edit_text("❌ Task was cancelled by user.")
+                await status_msg.edit_text("Task was cancelled by user.")
             except Exception:
                 pass
         except Exception as err:
@@ -459,30 +478,37 @@ async def file_handler(client: Client, message: Message):
         return
 
     task_id = uuid.uuid4().hex[:8]
-    keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("Yes (Test with rar t)", callback_data=f"test:yes:{task_id}"),
-            InlineKeyboardButton("No (Skip test)", callback_data=f"test:no:{task_id}")
-        ],
-        [
-            InlineKeyboardButton("❌ Cancel", callback_data=f"cancel:{task_id}")
-        ]
-    ])
-    prompt = await message.reply(
-        "Do you want to run an archive integrity test (`rar t`) after compression finishes?",
-        reply_markup=keyboard
-    )
-    ACTIVE_TASKS[task_id] = {
+    file_attr = message.document or message.video or message.audio
+    orig_name = getattr(file_attr, "file_name", None) or "file"
+    default_name = sanitize_filename(os.path.splitext(orig_name)[0])
+
+    custom_name = None
+    if message.caption:
+        clean_caption = sanitize_filename(message.caption.strip())
+        if clean_caption.lower().endswith(".rar"):
+            clean_caption = clean_caption[:-4]
+        if clean_caption:
+            custom_name = clean_caption
+
+    task_data = {
         "mode": "file",
         "message": message,
-        "status_msg": prompt,
+        "default_name": default_name,
+        "custom_name": custom_name,
         "user_id": user_id,
         "cancelled": False,
         "proc": None,
         "async_task": None
     }
+    ACTIVE_TASKS[task_id] = task_data
 
-@app.on_message(filters.regex(r"https?://[^\s]+"))
+    prompt = await message.reply(
+        get_setup_text(task_data),
+        reply_markup=get_setup_markup(task_id)
+    )
+    task_data["status_msg"] = prompt
+
+@app.on_message(filters.regex(r"^https?://"))
 async def link_handler(client: Client, message: Message):
     user_id = message.from_user.id if message.from_user else 0
     if not is_authorized(user_id):
@@ -490,29 +516,88 @@ async def link_handler(client: Client, message: Message):
         return
 
     task_id = uuid.uuid4().hex[:8]
-    keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("Yes (Test with rar t)", callback_data=f"test:yes:{task_id}"),
-            InlineKeyboardButton("No (Skip test)", callback_data=f"test:no:{task_id}")
-        ],
-        [
-            InlineKeyboardButton("❌ Cancel", callback_data=f"cancel:{task_id}")
-        ]
-    ])
-    prompt = await message.reply(
-        "Do you want to run an archive integrity test (`rar t`) after compression finishes?",
-        reply_markup=keyboard
-    )
-    ACTIVE_TASKS[task_id] = {
+    parts = message.text.strip().split(maxsplit=1)
+    url = parts[0]
+
+    custom_name = None
+    if len(parts) > 1:
+        clean_param = sanitize_filename(parts[1].strip())
+        if clean_param.lower().endswith(".rar"):
+            clean_param = clean_param[:-4]
+        if clean_param:
+            custom_name = clean_param
+
+    parsed = urlparse(url)
+    raw_filename = unquote(os.path.basename(parsed.path)) or "downloaded_file"
+    default_name = sanitize_filename(os.path.splitext(raw_filename)[0])
+
+    task_data = {
         "mode": "url",
-        "url": message.text.strip(),
+        "url": url,
+        "default_name": default_name,
+        "custom_name": custom_name,
         "message": message,
-        "status_msg": prompt,
         "user_id": user_id,
         "cancelled": False,
         "proc": None,
         "async_task": None
     }
+    ACTIVE_TASKS[task_id] = task_data
+
+    prompt = await message.reply(
+        get_setup_text(task_data),
+        reply_markup=get_setup_markup(task_id)
+    )
+    task_data["status_msg"] = prompt
+
+@app.on_message(filters.text & ~filters.command)
+async def text_input_handler(client: Client, message: Message):
+    user_id = message.from_user.id if message.from_user else 0
+    if user_id not in AWAITING_RENAME:
+        return
+
+    task_id = AWAITING_RENAME.pop(user_id)
+    task_data = ACTIVE_TASKS.get(task_id)
+    if not task_data:
+        await message.reply("Task expired or not found.")
+        return
+
+    raw_input = message.text.strip()
+    clean_name = sanitize_filename(raw_input)
+    if clean_name.lower().endswith(".rar"):
+        clean_name = clean_name[:-4]
+
+    task_data["custom_name"] = clean_name or task_data["default_name"]
+
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+    await task_data["status_msg"].edit_text(
+        get_setup_text(task_data),
+        reply_markup=get_setup_markup(task_id)
+    )
+
+@app.on_callback_query(filters.regex(r"^rename:([a-f0-9]+)$"))
+async def rename_callback_handler(client: Client, callback_query: CallbackQuery):
+    task_id = callback_query.data.split(":")[1]
+    task_data = ACTIVE_TASKS.get(task_id)
+
+    if not task_data:
+        await callback_query.answer("Task expired or not found.", show_alert=True)
+        return
+
+    if callback_query.from_user.id != task_data["user_id"]:
+        await callback_query.answer("Unauthorized.", show_alert=True)
+        return
+
+    AWAITING_RENAME[callback_query.from_user.id] = task_id
+    await callback_query.answer()
+    await task_data["status_msg"].edit_text(
+        "Send the new archive name in chat (without `.rar` extension):",
+        reply_markup=get_cancel_markup(task_id)
+    )
 
 @app.on_callback_query(filters.regex(r"^cancel:([a-f0-9]+)$"))
 async def cancel_callback_handler(client: Client, callback_query: CallbackQuery):
@@ -527,6 +612,7 @@ async def cancel_callback_handler(client: Client, callback_query: CallbackQuery)
         await callback_query.answer("Unauthorized.", show_alert=True)
         return
 
+    AWAITING_RENAME.pop(callback_query.from_user.id, None)
     await callback_query.answer("Cancelling task...")
     task_data["cancelled"] = True
 
@@ -546,7 +632,7 @@ async def cancel_callback_handler(client: Client, callback_query: CallbackQuery)
         shutil.rmtree(work_dir, ignore_errors=True)
 
     try:
-        await task_data["status_msg"].edit_text("❌ Task was cancelled by user.")
+        await task_data["status_msg"].edit_text("Task was cancelled by user.")
     except Exception:
         pass
 
@@ -565,6 +651,7 @@ async def test_callback_handler(client: Client, callback_query: CallbackQuery):
         await callback_query.answer("Unauthorized.", show_alert=True)
         return
 
+    AWAITING_RENAME.pop(callback_query.from_user.id, None)
     await callback_query.answer()
     should_test = (action == "yes")
     await task_data["status_msg"].edit_text("Task queued...", reply_markup=get_cancel_markup(task_id))
