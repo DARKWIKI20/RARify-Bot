@@ -92,6 +92,21 @@ def get_cancel_markup(task_id: str) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("Cancel", callback_data=f"cancel:{task_id}")]
     ])
 
+def get_options_markup(task_id: str, custom_name: str = "") -> InlineKeyboardMarkup:
+    rename_btn_text = f"Rename: {custom_name}.rar" if custom_name else "Set Custom Name"
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("Start: Test (rar t)", callback_data=f"test:yes:{task_id}"),
+            InlineKeyboardButton("Start: Skip Test", callback_data=f"test:no:{task_id}")
+        ],
+        [
+            InlineKeyboardButton(rename_btn_text, callback_data=f"rename:{task_id}")
+        ],
+        [
+            InlineKeyboardButton("Cancel", callback_data=f"cancel:{task_id}")
+        ]
+    ])
+
 async def progress_callback(current, total, status_msg: Message, action_name: str, state: dict, task_id: str):
     task_info = ACTIVE_TASKS.get(task_id)
     if task_info and task_info.get("cancelled"):
@@ -368,7 +383,7 @@ async def download_stream_url(url: str, dest_dir: str, status_msg: Message, task
             target_url, gofile_token, resolve_err = await resolve_gofile_url(url, session, custom_token)
             if resolve_err:
                 return False, "", f"Gofile Resolution Failed: {resolve_err}"
-            
+
             if gofile_token:
                 req_headers["Authorization"] = f"Bearer {gofile_token}"
                 req_headers["Cookie"] = f"accountToken={gofile_token}"
@@ -445,6 +460,7 @@ async def process_task(task_id: str, should_test: bool):
     mode = task_data["mode"]
     url = task_data.get("url")
     custom_token = task_data.get("custom_token", "")
+    custom_name = task_data.get("custom_name", "")
 
     work_dir = os.path.join("/tmp", f"rar_{uuid.uuid4().hex}")
     output_dir = os.path.join(work_dir, "output")
@@ -473,14 +489,16 @@ async def process_task(task_id: str, should_test: bool):
                     progress=progress_callback,
                     progress_args=(status_msg, stage, state, task_id)
                 )
-                base_name = sanitize_filename(os.path.splitext(orig_name)[0])
+                detected_name = os.path.splitext(orig_name)[0]
             else:
                 stage = "Downloading URL"
                 await status_msg.edit_text(f"Status: {stage}...", reply_markup=get_cancel_markup(task_id))
                 download_ok, file_path, dl_err = await download_stream_url(url, work_dir, status_msg, task_id, custom_token)
                 if not download_ok:
                     raise RuntimeError(f"URL download failed:\n{dl_err}")
-                base_name = sanitize_filename(os.path.splitext(os.path.basename(file_path))[0])
+                detected_name = os.path.splitext(os.path.basename(file_path))[0]
+
+            final_base_name = sanitize_filename(custom_name if custom_name else detected_name)
 
             if task_data.get("cancelled"):
                 raise asyncio.CancelledError()
@@ -497,7 +515,7 @@ async def process_task(task_id: str, should_test: bool):
                 raise asyncio.CancelledError()
 
             stage = "Compressing to RAR5 Solid (-m5)"
-            rar_target = os.path.join(output_dir, f"{base_name}.rar")
+            rar_target = os.path.join(output_dir, f"{final_base_name}.rar")
             await status_msg.edit_text(f"Status: {stage} (0%)...", reply_markup=get_cancel_markup(task_id))
             success, rar_log = await run_rar_compression(target, rar_target, status_msg, task_id)
             extra_log += f"\n--- RAR Log ---\n{rar_log}"
@@ -562,9 +580,11 @@ async def start_handler(client: Client, message: Message):
         return
     await message.reply(
         "Send any file or direct download link to compress into RAR (Best -m5).\n\n"
-        "**For Gofile links:**\n"
-        "You can send: `<URL>`\n"
-        "Or if requested: `<URL> | <accountToken>`"
+        "**Custom Naming Options:**\n"
+        "• Click the 'Set Custom Name' button before starting.\n"
+        "• Add desired name to the file caption.\n"
+        "• For URLs, append using pipe: `<URL> | <custom_name>`\n"
+        "• For Gofile: `<URL> | <token> | <custom_name>`"
     )
 
 @app.on_message(filters.document | filters.video | filters.audio)
@@ -575,30 +595,27 @@ async def file_handler(client: Client, message: Message):
         return
 
     task_id = uuid.uuid4().hex[:8]
-    keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("Yes (Test with rar t)", callback_data=f"test:yes:{task_id}"),
-            InlineKeyboardButton("No (Skip test)", callback_data=f"test:no:{task_id}")
-        ],
-        [
-            InlineKeyboardButton("Cancel", callback_data=f"cancel:{task_id}")
-        ]
-    ])
+    custom_name = ""
+    if message.caption:
+        custom_name = sanitize_filename(os.path.splitext(message.caption.strip())[0])
+
     prompt = await message.reply(
-        "Do you want to run an archive integrity test (`rar t`) after compression finishes?",
-        reply_markup=keyboard
+        f"Ready to compress.\n• Target: `{custom_name or 'Default'}.rar`\n\nConfigure options:",
+        reply_markup=get_options_markup(task_id, custom_name)
     )
     ACTIVE_TASKS[task_id] = {
         "mode": "file",
         "message": message,
         "status_msg": prompt,
         "user_id": user_id,
+        "custom_name": custom_name,
+        "waiting_for_name": False,
         "cancelled": False,
         "proc": None,
         "async_task": None
     }
 
-@app.on_message(filters.regex(r"https?://[^\s]+"))
+@app.on_message(filters.regex(r"^https?://[^\s]+"))
 async def link_handler(client: Client, message: Message):
     user_id = message.from_user.id if message.from_user else 0
     if not is_authorized(user_id):
@@ -606,39 +623,78 @@ async def link_handler(client: Client, message: Message):
         return
 
     raw_text = message.text.strip()
+    parts = [p.strip() for p in raw_text.split("|")]
+    url = parts[0]
     custom_token = ""
-    if "|" in raw_text:
-        parts = raw_text.split("|", 1)
-        url = parts[0].strip()
-        custom_token = parts[1].strip()
-    else:
-        url = raw_text
+    custom_name = ""
+
+    if len(parts) == 2:
+        if "gofile.io" in url and len(parts[1]) > 25 and " " not in parts[1]:
+            custom_token = parts[1]
+        else:
+            custom_name = sanitize_filename(os.path.splitext(parts[1])[0])
+    elif len(parts) >= 3:
+        custom_token = parts[1]
+        custom_name = sanitize_filename(os.path.splitext(parts[2])[0])
 
     task_id = uuid.uuid4().hex[:8]
-    keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("Yes (Test with rar t)", callback_data=f"test:yes:{task_id}"),
-            InlineKeyboardButton("No (Skip test)", callback_data=f"test:no:{task_id}")
-        ],
-        [
-            InlineKeyboardButton("Cancel", callback_data=f"cancel:{task_id}")
-        ]
-    ])
     prompt = await message.reply(
-        "Do you want to run an archive integrity test (`rar t`) after compression finishes?",
-        reply_markup=keyboard
+        f"Ready to compress URL.\n• Target: `{custom_name or 'Default'}.rar`\n\nConfigure options:",
+        reply_markup=get_options_markup(task_id, custom_name)
     )
     ACTIVE_TASKS[task_id] = {
         "mode": "url",
         "url": url,
         "custom_token": custom_token,
+        "custom_name": custom_name,
         "message": message,
         "status_msg": prompt,
         "user_id": user_id,
+        "waiting_for_name": False,
         "cancelled": False,
         "proc": None,
         "async_task": None
     }
+
+@app.on_message(filters.text & ~filters.command(["start", "help"]))
+async def text_input_handler(client: Client, message: Message):
+    user_id = message.from_user.id if message.from_user else 0
+    if not is_authorized(user_id):
+        return
+
+    for task_id, task_data in list(ACTIVE_TASKS.items()):
+        if task_data.get("user_id") == user_id and task_data.get("waiting_for_name"):
+            task_data["waiting_for_name"] = False
+            raw_input = message.text.strip()
+            new_name = sanitize_filename(os.path.splitext(raw_input)[0])
+            if new_name:
+                task_data["custom_name"] = new_name
+
+            await task_data["status_msg"].edit_text(
+                f"Ready to compress.\n• Target: `{task_data.get('custom_name')}.rar`\n\nConfigure options:",
+                reply_markup=get_options_markup(task_id, task_data.get("custom_name"))
+            )
+            return
+
+@app.on_callback_query(filters.regex(r"^rename:([a-f0-9]+)$"))
+async def rename_callback_handler(client: Client, callback_query: CallbackQuery):
+    task_id = callback_query.data.split(":")[1]
+    task_data = ACTIVE_TASKS.get(task_id)
+
+    if not task_data:
+        await callback_query.answer("Task expired or not found.", show_alert=True)
+        return
+
+    if callback_query.from_user.id != task_data["user_id"]:
+        await callback_query.answer("Unauthorized.", show_alert=True)
+        return
+
+    task_data["waiting_for_name"] = True
+    await callback_query.answer()
+    await task_data["status_msg"].edit_text(
+        "Please send the new filename as a text message (extension `.rar` will be appended automatically):",
+        reply_markup=get_cancel_markup(task_id)
+    )
 
 @app.on_callback_query(filters.regex(r"^cancel:([a-f0-9]+)$"))
 async def cancel_callback_handler(client: Client, callback_query: CallbackQuery):
@@ -691,6 +747,7 @@ async def test_callback_handler(client: Client, callback_query: CallbackQuery):
         await callback_query.answer("Unauthorized.", show_alert=True)
         return
 
+    task_data["waiting_for_name"] = False
     await callback_query.answer()
     should_test = (action == "yes")
     await task_data["status_msg"].edit_text("Task queued...", reply_markup=get_cancel_markup(task_id))
