@@ -54,6 +54,13 @@ task_semaphore = asyncio.Semaphore(1)
 ACTIVE_TASKS = {}
 AWAITING_RENAME = {}
 
+HTTP_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+    "Accept": "*/*",
+    "Accept-Encoding": "identity",
+    "Connection": "keep-alive"
+}
+
 app = Client(
     "rar_worker_bot",
     api_id=API_ID,
@@ -87,6 +94,62 @@ def is_authorized(user_id: int) -> bool:
         return True
     return user_id in ALLOWED_USERS
 
+def extract_filename_from_headers(headers: dict, url: str) -> str:
+    cd = headers.get("Content-Disposition", "")
+    if cd:
+        match_utf8 = re.search(r"filename\*\s*=\s*UTF-8''([^;]+)", cd, re.IGNORECASE)
+        if match_utf8:
+            return unquote(match_utf8.group(1).strip('"\' '))
+        match = re.search(r'filename\s*=\s*"([^"]+)"', cd, re.IGNORECASE)
+        if match:
+            return unquote(match.group(1).strip())
+        match_bare = re.search(r'filename\s*=\s*([^;]+)', cd, re.IGNORECASE)
+        if match_bare:
+            return unquote(match_bare.group(1).strip('"\' '))
+    parsed = urlparse(url)
+    raw_name = os.path.basename(parsed.path)
+    return unquote(raw_name) if raw_name else "downloaded_file"
+
+async def validate_url(url: str) -> tuple[bool, str, str, int]:
+    timeout = aiohttp.ClientTimeout(total=20)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout, headers=HTTP_HEADERS) as session:
+            try:
+                async with session.head(url, allow_redirects=True) as resp:
+                    if resp.status in (200, 206):
+                        fname = extract_filename_from_headers(dict(resp.headers), str(resp.url))
+                        size = int(resp.headers.get("Content-Length", 0))
+                        return True, "", fname, size
+                    if resp.status not in (405, 403, 400):
+                        if resp.status == 410:
+                            return False, "Link expired (410 Gone).", "", 0
+                        if resp.status == 404:
+                            return False, "Resource not found (404 Not Found).", "", 0
+                        return False, f"Server returned HTTP {resp.status} ({resp.reason}).", "", 0
+            except (aiohttp.ClientError, asyncio.TimeoutError):
+                pass
+
+            async with session.get(url, allow_redirects=True) as resp:
+                if resp.status in (200, 206):
+                    fname = extract_filename_from_headers(dict(resp.headers), str(resp.url))
+                    size = int(resp.headers.get("Content-Length", 0))
+                    return True, "", fname, size
+                elif resp.status == 410:
+                    return False, "Link expired (410 Gone).", "", 0
+                elif resp.status == 404:
+                    return False, "Resource not found (404 Not Found).", "", 0
+                elif resp.status == 403:
+                    return False, "Access forbidden (403 Forbidden - link expired or auth required).", "", 0
+                else:
+                    return False, f"Link unreachable (HTTP {resp.status}: {resp.reason}).", "", 0
+
+    except aiohttp.ClientConnectorError as e:
+        return False, f"Connection failed (Host unreachable / DNS error: {e}).", "", 0
+    except asyncio.TimeoutError:
+        return False, "Validation timed out after 20 seconds.", "", 0
+    except Exception as e:
+        return False, f"Validation error: {type(e).__name__} - {e}", "", 0
+
 def get_cancel_markup(task_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("Cancel", callback_data=f"cancel:{task_id}")]
@@ -108,8 +171,12 @@ def get_setup_markup(task_id: str) -> InlineKeyboardMarkup:
 
 def get_setup_text(task_data: dict) -> str:
     name = task_data.get("custom_name") or task_data.get("default_name")
+    size_str = ""
+    if task_data.get("remote_size"):
+        size_str = f"**Size:** `{human_size(task_data['remote_size'])}`\n"
     return (
-        f"**Target Archive:** `{name}.rar`\n\n"
+        f"**Target Archive:** `{name}.rar`\n"
+        f"{size_str}\n"
         "Do you want to run an archive integrity test (`rar t`) after compression finishes?"
     )
 
@@ -130,7 +197,7 @@ async def progress_callback(current, total, status_msg: Message, action_name: st
 
     percent = (current / total) * 100 if total > 0 else 0
     filled = int(percent // 10)
-    bar = "█" * filled + "░" * (10 - filled)
+    bar = "=" * filled + "-" * (10 - filled)
     text = (
         f"**Status:** {action_name}\n"
         f"[{bar}] {percent:.1f}%\n"
@@ -165,7 +232,7 @@ async def update_compression_progress(percent: int, status_msg: Message, state: 
         eta_str = "Calculating..."
 
     filled = int(percent // 10)
-    bar = "█" * filled + "░" * (10 - filled)
+    bar = "=" * filled + "-" * (10 - filled)
     text = (
         f"**Status:** Compressing to RAR5 Solid (-m5)\n"
         f"[{bar}] {percent}%\n"
@@ -188,9 +255,9 @@ async def send_detailed_error(message: Message, status_msg: Message, stage: str,
 
     content = (
         f"**Failed:** Task Execution Error\n"
-        f"• **Stage:** `{stage}`\n"
-        f"• **Type:** `{error_type}`\n"
-        f"• **Detail:** `{error_msg}`\n"
+        f"- **Stage:** `{stage}`\n"
+        f"- **Type:** `{error_type}`\n"
+        f"- **Detail:** `{error_msg}`\n"
     )
     if extra_log:
         content += f"\n**Process Output:**\n```{extra_log[-1500:]}```\n"
@@ -315,14 +382,7 @@ async def download_stream_url(url: str, dest_path: str, status_msg: Message, tas
     state = {"start_time": time.time(), "last_update": 0}
     timeout = aiohttp.ClientTimeout(total=7200)
 
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
-        "Accept": "*/*",
-        "Accept-Encoding": "identity",
-        "Connection": "keep-alive"
-    }
-
-    async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+    async with aiohttp.ClientSession(timeout=timeout, headers=HTTP_HEADERS) as session:
         async with session.get(url, allow_redirects=True) as resp:
             if resp.status != 200:
                 return False, f"HTTP Status {resp.status}: {resp.reason}"
@@ -387,8 +447,10 @@ async def process_task(task_id: str, should_test: bool):
                 )
             else:
                 stage = "Downloading URL"
-                parsed = urlparse(url)
-                raw_filename = unquote(os.path.basename(parsed.path)) or "downloaded_file"
+                raw_filename = task_data.get("resolved_filename")
+                if not raw_filename:
+                    parsed = urlparse(url)
+                    raw_filename = unquote(os.path.basename(parsed.path)) or "downloaded_file"
                 raw_filename = sanitize_filename(raw_filename)
                 file_path = os.path.join(work_dir, raw_filename)
 
@@ -460,7 +522,7 @@ async def process_task(task_id: str, should_test: bool):
             await status_msg.delete()
 
         except asyncio.CancelledError:
-            logger.info(f"Task {task_id} successfully cancelled.")
+            logger.info(f"Task {task_id} cancelled.")
             try:
                 await status_msg.edit_text("Task was cancelled by user.")
             except Exception:
@@ -523,9 +585,17 @@ async def link_handler(client: Client, message: Message):
         await message.reply("Access denied.")
         return
 
-    task_id = uuid.uuid4().hex[:8]
     parts = message.text.strip().split(maxsplit=1)
     url = parts[0]
+
+    status_msg = await message.reply("Validating URL status...")
+
+    is_valid, err_msg, detected_filename, content_size = await validate_url(url)
+    if not is_valid:
+        await status_msg.edit_text(f"**URL Validation Failed:**\n`{err_msg}`")
+        return
+
+    task_id = uuid.uuid4().hex[:8]
 
     custom_name = None
     if len(parts) > 1:
@@ -535,16 +605,18 @@ async def link_handler(client: Client, message: Message):
         if clean_param:
             custom_name = clean_param
 
-    parsed = urlparse(url)
-    raw_filename = unquote(os.path.basename(parsed.path)) or "downloaded_file"
-    default_name = sanitize_filename(os.path.splitext(raw_filename)[0])
+    resolved_filename = detected_filename or "downloaded_file"
+    default_name = sanitize_filename(os.path.splitext(resolved_filename)[0])
 
     task_data = {
         "mode": "url",
         "url": url,
         "default_name": default_name,
         "custom_name": custom_name,
+        "resolved_filename": resolved_filename,
+        "remote_size": content_size,
         "message": message,
+        "status_msg": status_msg,
         "user_id": user_id,
         "cancelled": False,
         "proc": None,
@@ -552,11 +624,10 @@ async def link_handler(client: Client, message: Message):
     }
     ACTIVE_TASKS[task_id] = task_data
 
-    prompt = await message.reply(
+    await status_msg.edit_text(
         get_setup_text(task_data),
         reply_markup=get_setup_markup(task_id)
     )
-    task_data["status_msg"] = prompt
 
 @app.on_message(filters.text & ~filters.regex(r"^/"))
 async def text_input_handler(client: Client, message: Message):
