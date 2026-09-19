@@ -467,4 +467,4 @@ if __name__ == "__main__":
     try:
         loop.run_until_complete(main())
     except (KeyboardInterrupt, SystemExit):
-        loop.run_until_complete(app.stop())س
+        loop.run_until_complete(app.stop())
