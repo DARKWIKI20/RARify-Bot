@@ -68,6 +68,15 @@ def human_size(size_bytes: int) -> str:
     p = math.pow(1024, i)
     return f"{round(size_bytes / p, 2)} {units[i]}"
 
+def format_time(seconds: float) -> str:
+    if seconds is None or seconds < 0 or math.isinf(seconds) or math.isnan(seconds):
+        return "--:--"
+    m, s = divmod(int(seconds), 60)
+    h, m = divmod(m, 60)
+    if h > 0:
+        return f"{h:02d}:{m:02d}:{s:02d}"
+    return f"{m:02d}:{s:02d}"
+
 def sanitize_filename(name: str) -> str:
     cleaned = re.sub(r'[\\/*?:"<>|]', "_", name).strip()
     return cleaned if cleaned else "archive"
@@ -81,14 +90,21 @@ async def progress_callback(current, total, status_msg: Message, action_name: st
     now = time.time()
     if now - state.get("last_update", 0) < 4 and current != total:
         return
+
+    start_time = state.setdefault("start_time", now)
     state["last_update"] = now
+    elapsed = max(0.1, now - start_time)
+    speed = current / elapsed
+    eta = (total - current) / speed if speed > 0 and total > current else 0
+
     percent = (current / total) * 100 if total > 0 else 0
     filled = int(percent // 10)
     bar = "█" * filled + "░" * (10 - filled)
     text = (
         f"**Status:** {action_name}\n"
         f"[{bar}] {percent:.1f}%\n"
-        f"{human_size(current)} / {human_size(total)}"
+        f"Transferred: {human_size(current)} / {human_size(total)}\n"
+        f"Speed: {human_size(int(speed))}/s | ETA: {format_time(eta)}"
     )
     try:
         await status_msg.edit_text(text)
@@ -101,13 +117,25 @@ async def update_compression_progress(percent: int, status_msg: Message, state: 
     now = time.time()
     if now - state.get("last_update", 0) < 4 and percent < 100:
         return
+
+    start_time = state.setdefault("start_time", now)
     state["last_update"] = now
+    elapsed = max(0.1, now - start_time)
+
+    if percent > 0:
+        total_estimated = elapsed / (percent / 100.0)
+        eta = max(0.0, total_estimated - elapsed)
+        eta_str = format_time(eta)
+    else:
+        eta_str = "Calculating..."
+
     filled = int(percent // 10)
     bar = "█" * filled + "░" * (10 - filled)
     text = (
         f"**Status:** Compressing to RAR (-m5)\n"
         f"[{bar}] {percent}%\n"
-        f"Mode: Best | Dict: 64MB | RR: 5%"
+        f"Mode: Best | Dict: 64MB | RR: 5%\n"
+        f"Elapsed: {format_time(elapsed)} | ETA: {eta_str}"
     )
     try:
         await status_msg.edit_text(text)
@@ -124,7 +152,8 @@ async def send_detailed_error(message: Message, status_msg: Message, stage: str,
     logger.error(f"Error [{stage}]: {error_type}: {error_msg}\n{tb}\nExtra: {extra_log}")
 
     content = (
-        f"❌ **Stage:** `{stage}`\n"
+        f"**Failed:** Task Execution Error\n"
+        f"• **Stage:** `{stage}`\n"
         f"• **Type:** `{error_type}`\n"
         f"• **Detail:** `{error_msg}`\n"
     )
@@ -137,13 +166,13 @@ async def send_detailed_error(message: Message, status_msg: Message, stage: str,
         if len(content) <= 4000:
             await status_msg.edit_text(content)
         else:
-            await status_msg.edit_text(f"❌ Error in stage `{stage}`: {error_type} - {error_msg}\nFull log attached.")
-            full_log = f"Stage: {stage}\nError: {error_type} - {error_msg}\n\nExtra Log:\n{extra_log}\n\nTraceback:\n{tb}"
+            await status_msg.edit_text(f"Error in stage `{stage}`: {error_type} - {error_msg}\nFull log attached.")
+            full_log = f"Stage: {stage}\nError: {error_type} - {error_msg}\n\nProcess Log:\n{extra_log}\n\nTraceback:\n{tb}"
             file_data = BytesIO(full_log.encode("utf-8"))
             file_data.name = "error_report.txt"
             await message.reply_document(document=file_data, caption=f"Error Log: {stage}")
     except Exception as err:
-        logger.error(f"Failed to send error to telegram: {err}")
+        logger.error(f"Failed to deliver error report: {err}")
 
 async def extract_archive_if_needed(file_path: str, extract_to: str) -> tuple[bool, str]:
     ext = os.path.splitext(file_path)[1].lower()
@@ -183,7 +212,7 @@ async def run_rar_compression(input_target: str, output_rar_archive: str, status
 
     full_log = []
     buf = ""
-    state = {"last_update": 0}
+    state = {"start_time": time.time(), "last_update": 0}
 
     while True:
         chunk = await proc.stdout.read(64)
@@ -218,7 +247,7 @@ async def run_rar_test(rar_file: str) -> tuple[bool, str]:
     return (proc.returncode == 0), log
 
 async def download_stream_url(url: str, dest_path: str, status_msg: Message) -> tuple[bool, str]:
-    state = {"last_update": 0}
+    state = {"start_time": time.time(), "last_update": 0}
     timeout = aiohttp.ClientTimeout(total=7200)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         async with session.get(url, allow_redirects=True) as resp:
@@ -263,7 +292,7 @@ async def process_task(task_id: str, should_test: bool):
             if mode == "file":
                 stage = "Downloading from Telegram"
                 await status_msg.edit_text(f"Status: {stage}...")
-                state = {"last_update": 0}
+                state = {"start_time": time.time(), "last_update": 0}
 
                 file_attr = message.document or message.video or message.audio
                 orig_name = getattr(file_attr, "file_name", None) or "input_file"
@@ -317,13 +346,13 @@ async def process_task(task_id: str, should_test: bool):
                 test_passed, test_log = await run_rar_test(generated_parts[0])
                 extra_log += f"\n--- Test Log ---\n{test_log}"
                 if not test_passed:
-                    raise RuntimeError(f"RAR Integrity Test Failed (CRC mismatch or corruption):\n{test_log}")
+                    raise RuntimeError(f"RAR Integrity Test Failed:\n{test_log}")
                 await status_msg.edit_text("Status: RAR Integrity Test Passed (100% OK). Preparing upload...")
                 await asyncio.sleep(1)
 
             stage = "Uploading Part(s)"
             for idx, part in enumerate(generated_parts, 1):
-                part_state = {"last_update": 0}
+                part_state = {"start_time": time.time(), "last_update": 0}
                 await status_msg.edit_text(f"Uploading part {idx}/{len(generated_parts)}...")
                 await message.reply_document(
                     document=part,
@@ -344,7 +373,7 @@ async def start_handler(client: Client, message: Message):
     if not is_authorized(message.from_user.id):
         await message.reply("Access denied.")
         return
-    await message.reply("Send any file or URL to compress into RAR (Best -m5).")
+    await message.reply("Send any file or direct download link to compress into RAR (Best -m5).")
 
 @app.on_message(filters.document | filters.video | filters.audio)
 async def file_handler(client: Client, message: Message):
@@ -356,12 +385,12 @@ async def file_handler(client: Client, message: Message):
     task_id = uuid.uuid4().hex[:8]
     keyboard = InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("بله (تست سلامت با rar t)", callback_data=f"test:yes:{task_id}"),
-            InlineKeyboardButton("خیر (بدون تست)", callback_data=f"test:no:{task_id}")
+            InlineKeyboardButton("Yes (Test with rar t)", callback_data=f"test:yes:{task_id}"),
+            InlineKeyboardButton("No (Skip test)", callback_data=f"test:no:{task_id}")
         ]
     ])
     prompt = await message.reply(
-        "آیا می‌خواهید پس از اتمام فشرده‌سازی، تست سلامت آرشیو (`rar t`) اجرا شود؟",
+        "Do you want to run an archive integrity test (`rar t`) after compression finishes?",
         reply_markup=keyboard
     )
     PENDING_TASKS[task_id] = {
@@ -381,12 +410,12 @@ async def link_handler(client: Client, message: Message):
     task_id = uuid.uuid4().hex[:8]
     keyboard = InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("بله (تست سلامت با rar t)", callback_data=f"test:yes:{task_id}"),
-            InlineKeyboardButton("خیر (بدون تست)", callback_data=f"test:no:{task_id}")
+            InlineKeyboardButton("Yes (Test with rar t)", callback_data=f"test:yes:{task_id}"),
+            InlineKeyboardButton("No (Skip test)", callback_data=f"test:no:{task_id}")
         ]
     ])
     prompt = await message.reply(
-        "آیا می‌خواهید پس از اتمام فشرده‌سازی، تست سلامت آرشیو (`rar t`) اجرا شود؟",
+        "Do you want to run an archive integrity test (`rar t`) after compression finishes?",
         reply_markup=keyboard
     )
     PENDING_TASKS[task_id] = {
@@ -403,16 +432,16 @@ async def test_callback_handler(client: Client, callback_query: CallbackQuery):
     task_data = PENDING_TASKS.get(task_id)
 
     if not task_data:
-        await callback_query.answer("این عملیات منقضی شده است.", show_alert=True)
+        await callback_query.answer("Task expired or not found.", show_alert=True)
         return
 
     if callback_query.from_user.id != task_data["user_id"]:
-        await callback_query.answer("تنها ارسال‌کننده درخواست مجاز به انتخاب است.", show_alert=True)
+        await callback_query.answer("Unauthorized.", show_alert=True)
         return
 
     await callback_query.answer()
     should_test = (action == "yes")
-    await task_data["status_msg"].edit_text("Task added to queue...")
+    await task_data["status_msg"].edit_text("Task queued...")
     asyncio.create_task(process_task(task_id, should_test))
 
 async def start_web_health():
@@ -438,4 +467,4 @@ if __name__ == "__main__":
     try:
         loop.run_until_complete(main())
     except (KeyboardInterrupt, SystemExit):
-        loop.run_until_complete(app.stop())
+        loop.run_until_complete(app.stop())س
