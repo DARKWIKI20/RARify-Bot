@@ -293,8 +293,8 @@ async def run_rar_test(rar_file: str, task_id: str) -> tuple[bool, str]:
 async def get_gofile_guest_token(session: aiohttp.ClientSession) -> str:
     try:
         post_headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            "Accept": "application/json, text/plain, */*",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+            "Accept": "application/json",
             "Origin": "https://gofile.io",
             "Referer": "https://gofile.io/",
         }
@@ -307,12 +307,52 @@ async def get_gofile_guest_token(session: aiohttp.ClientSession) -> str:
         logger.warning(f"Gofile guest account creation failed: {e}")
     return ""
 
+async def resolve_gofile_url(url: str, session: aiohttp.ClientSession, custom_token: str) -> tuple[str, str, str]:
+    token = custom_token or GOFILE_TOKEN_ENV
+    if not token:
+        token = await get_gofile_guest_token(session)
+
+    if not token:
+        return url, "", "Failed to acquire Gofile Token."
+
+    match = re.search(r"(?:gofile\.io/(?:d/|download/web/)|contents/)([a-zA-Z0-9-]+)", url)
+    if not match:
+        return url, token, ""
+
+    content_id = match.group(1)
+    api_url = f"https://api.gofile.io/contents/{content_id}"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        "Authorization": f"Bearer {token}"
+    }
+
+    try:
+        async with session.get(api_url, headers=headers) as resp:
+            if resp.status == 200:
+                res_data = await resp.json()
+                if res_data.get("status") == "ok":
+                    d = res_data.get("data", {})
+                    if d.get("type") == "file" and d.get("link"):
+                        return d["link"], token, ""
+                    elif d.get("type") == "folder":
+                        children = d.get("children", {})
+                        for item in children.values():
+                            if item.get("link"):
+                                return item["link"], token, ""
+                    return url, token, "Gofile API did not return a valid download link."
+                else:
+                    return url, token, f"Gofile API rejected request: {res_data.get('status')} - Provide a valid accountToken."
+            else:
+                return url, token, f"Gofile API HTTP Error {resp.status}"
+    except Exception as e:
+        return url, token, f"Gofile API exception: {e}"
+
 async def download_stream_url(url: str, dest_dir: str, status_msg: Message, task_id: str, custom_token: str = "") -> tuple[bool, str, str]:
     state = {"start_time": time.time(), "last_update": 0}
     timeout = aiohttp.ClientTimeout(total=7200)
 
     base_headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         "Accept": "*/*",
         "Accept-Encoding": "identity",
         "Referer": "https://gofile.io/",
@@ -325,28 +365,20 @@ async def download_stream_url(url: str, dest_dir: str, status_msg: Message, task
         cookies = {}
 
         if "gofile.io" in url:
-            token = custom_token or GOFILE_TOKEN_ENV
-            if not token:
-                token = await get_gofile_guest_token(session)
-
-            if token:
-                req_headers["Authorization"] = f"Bearer {token}"
-                req_headers["Cookie"] = f"accountToken={token}"
-                cookies["accountToken"] = token
-            else:
-                return False, "", (
-                    "Could not generate a Gofile guest token from server IP.\n"
-                    "Please provide your personal token:\n"
-                    "1) Send as: `<URL> | <token>`\n"
-                    "2) Or set `GOFILE_TOKEN` in Railway Variables."
-                )
+            target_url, gofile_token, resolve_err = await resolve_gofile_url(url, session, custom_token)
+            if resolve_err:
+                return False, "", f"Gofile Resolution Failed: {resolve_err}"
+            
+            if gofile_token:
+                req_headers["Authorization"] = f"Bearer {gofile_token}"
+                req_headers["Cookie"] = f"accountToken={gofile_token}"
+                cookies["accountToken"] = gofile_token
 
         async with session.get(target_url, headers=req_headers, cookies=cookies, allow_redirects=True) as resp:
             redirect_target = str(resp.url).rstrip("/")
             if redirect_target in ("https://gofile.io", "http://gofile.io"):
                 return False, "", (
-                    "Gofile authentication failed (Server redirected to homepage).\n"
-                    "The provided or auto-generated token was rejected by Gofile.\n"
+                    "Gofile authentication failed (Redirected to homepage).\n"
                     "Provide your browser accountToken:\n"
                     "`<URL> | <accountToken>`"
                 )
