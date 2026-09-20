@@ -85,8 +85,14 @@ def format_time(seconds: float) -> str:
         return f"{h:02d}:{m:02d}:{s:02d}"
     return f"{m:02d}:{s:02d}"
 
-def sanitize_filename(name: str) -> str:
+def sanitize_filename(name: str, max_len: int = 60) -> str:
+    if not name:
+        return "archive"
+    name = re.sub(r'[\r\n\t]+', ' ', name)
     cleaned = re.sub(r'[\\/*?:"<>|]', "_", name).strip()
+    cleaned = re.sub(r'\s+', ' ', cleaned)
+    if len(cleaned.encode('utf-8')) > max_len:
+        cleaned = cleaned[:max_len].rstrip(' ._-')
     return cleaned if cleaned else "archive"
 
 def is_authorized(user_id: int) -> bool:
@@ -554,9 +560,10 @@ async def file_handler(client: Client, message: Message):
 
     custom_name = None
     if message.caption:
-        clean_caption = sanitize_filename(message.caption.strip())
+        first_line = message.caption.strip().split("\n")[0].strip()
+        clean_caption = sanitize_filename(first_line)
         if clean_caption.lower().endswith(".rar"):
-            clean_caption = clean_caption[:-4]
+            clean_caption = clean_caption[:-4].strip()
         if clean_caption:
             custom_name = clean_caption
 
@@ -599,9 +606,10 @@ async def link_handler(client: Client, message: Message):
 
     custom_name = None
     if len(parts) > 1:
-        clean_param = sanitize_filename(parts[1].strip())
+        first_line = parts[1].strip().split("\n")[0].strip()
+        clean_param = sanitize_filename(first_line)
         if clean_param.lower().endswith(".rar"):
-            clean_param = clean_param[:-4]
+            clean_param = clean_param[:-4].strip()
         if clean_param:
             custom_name = clean_param
 
@@ -641,10 +649,10 @@ async def text_input_handler(client: Client, message: Message):
         await message.reply("Task expired or not found.")
         return
 
-    raw_input = message.text.strip()
+    raw_input = message.text.strip().split("\n")[0].strip()
     clean_name = sanitize_filename(raw_input)
     if clean_name.lower().endswith(".rar"):
-        clean_name = clean_name[:-4]
+        clean_name = clean_name[:-4].strip()
 
     task_data["custom_name"] = clean_name or task_data["default_name"]
 
