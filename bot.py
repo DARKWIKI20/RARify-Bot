@@ -7,7 +7,6 @@ import time
 import math
 import uuid
 import shutil
-import signal
 import hashlib
 import asyncio
 import logging
@@ -16,7 +15,7 @@ from io import BytesIO
 from urllib.parse import unquote, urlparse
 import aiohttp
 from aiohttp import web
-from pyrogram import Client, filters
+from pyrogram import Client, filters, idle
 from pyrogram.types import (
     Message,
     CallbackQuery,
@@ -184,7 +183,6 @@ def cleanup_orphaned_dirs():
     return removed
 
 async def clear_active_webhook():
-    """Drops existing webhook to allow Telegram Polling to function without conflict."""
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook?drop_pending_updates=True"
     try:
         async with aiohttp.ClientSession() as session:
@@ -192,7 +190,7 @@ async def clear_active_webhook():
                 res_json = await resp.json()
                 logger.info(f"Telegram Webhook Status: {res_json}")
     except Exception as e:
-        logger.warning(f"Webhook reset attempt returned: {e}")
+        logger.warning(f"Webhook reset attempt error: {e}")
 
 # ==================== HELPERS ====================
 def human_size(size_bytes: int | float) -> str:
@@ -802,7 +800,6 @@ async def process_task(task_id: str, should_test: bool):
 
             initial_size = os.path.getsize(file_path) if os.path.exists(file_path) else 0
 
-            # Bypass extraction for APK/Office/Packages
             ext_mode = task_data.get("extract_mode", "auto")
             extract_dir = os.path.join(work_dir, "extracted")
             extracted = False
@@ -1531,7 +1528,7 @@ async def start_task_callback(client: Client, callback_query: CallbackQuery):
     t = asyncio.create_task(process_task(task_id, should_test))
     task_data["async_task"] = t
 
-# ==================== WEB SERVER & APP START ====================
+# ==================== WEB SERVER & APP LIFECYCLE ====================
 async def start_web_health():
     app_web = web.Application()
 
@@ -1570,23 +1567,15 @@ async def main():
     cleaned = cleanup_orphaned_dirs()
     if cleaned:
         logger.info(f"Cleaned {cleaned} orphaned directories on startup.")
-    
-    # Reset existing webhooks so Pyrogram polling works instantly
-    await clear_active_webhook()
 
+    await clear_active_webhook()
     await start_web_health()
+
     await app.start()
     logger.info("RAR5 Pro Bot started successfully.")
-    stop_event = asyncio.Event()
 
-    loop = asyncio.get_running_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        try:
-            loop.add_signal_handler(sig, stop_event.set)
-        except NotImplementedError:
-            pass
+    await idle()
 
-    await stop_event.wait()
     await shutdown_cleanup()
     await app.stop()
 
