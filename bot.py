@@ -58,7 +58,6 @@ if not API_HASH or not BOT_TOKEN:
     logger.critical("FATAL: API_HASH and BOT_TOKEN are required.")
     sys.exit(1)
 
-# Files that must NOT be extracted in Auto mode (APK, Office, Packages)
 NO_EXTRACT_EXTENSIONS = {
     ".apk", ".xapk", ".apks", ".apkm", ".aab", ".jar", ".war", ".ear",
     ".ipa", ".msix", ".appx", ".deb", ".rpm", ".whl", ".egg",
@@ -104,7 +103,7 @@ app = Client(
     workdir=DATA_DIR
 )
 
-# ==================== PERSISTENCE & DATA ====================
+# ==================== DATA PERSISTENCE ====================
 def load_all_data():
     global USER_PREFS, ADMIN_CONFIG
     if os.path.exists(PREFS_FILE):
@@ -183,6 +182,17 @@ def cleanup_orphaned_dirs():
     except Exception as e:
         logger.warning(f"Startup cleanup error: {e}")
     return removed
+
+async def clear_active_webhook():
+    """Drops existing webhook to allow Telegram Polling to function without conflict."""
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook?drop_pending_updates=True"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=10) as resp:
+                res_json = await resp.json()
+                logger.info(f"Telegram Webhook Status: {res_json}")
+    except Exception as e:
+        logger.warning(f"Webhook reset attempt returned: {e}")
 
 # ==================== HELPERS ====================
 def human_size(size_bytes: int | float) -> str:
@@ -266,7 +276,7 @@ def compute_hashes(file_path: str) -> tuple[str, str]:
             sha256.update(chunk)
     return md5.hexdigest(), sha256.hexdigest()
 
-# ==================== URL PARSER & DOWNLOAD ====================
+# ==================== URL UTILS ====================
 def parse_link_message(text: str) -> tuple[str, str | None, dict]:
     custom_headers = {}
     custom_name = None
@@ -413,10 +423,9 @@ def get_setup_text(task_data: dict) -> str:
         f"- **Split Size:** {split_str} | **Dict:** `{task_data.get('dict_size', '64m')}`\n"
         f"- **Solid:** `{'Yes' if task_data.get('solid') else 'No'}` | **Recovery:** `{'3%' if task_data.get('recovery') else 'Off'}`\n"
         f"- **Password:** {pwd_str}\n\n"
-        f"Press buttons to adjust settings, then choose **Start**:"
+        f"Adjust options or click **Start**:"
     )
 
-# ==================== ADMIN PANEL MARKUP ====================
 def get_admin_panel_markup() -> InlineKeyboardMarkup:
     lock_status = "Whitelist Only (Private)" if ADMIN_CONFIG.get("whitelist_only", True) else "Open to All (Public)"
     users_count = len(ADMIN_CONFIG.get("allowed_users", []))
@@ -729,7 +738,7 @@ async def safe_reply_document(message: Message, document: str, caption: str, thu
             logger.warning(f"FloodWait of {e.value}s during upload...")
             await asyncio.sleep(e.value + 1)
 
-# ==================== MAIN TASK WORKFLOW ====================
+# ==================== PIPELINE EXECUTION ====================
 async def process_task(task_id: str, should_test: bool):
     task_data = ACTIVE_TASKS.get(task_id)
     if not task_data:
@@ -793,7 +802,7 @@ async def process_task(task_id: str, should_test: bool):
 
             initial_size = os.path.getsize(file_path) if os.path.exists(file_path) else 0
 
-            # Extraction check (Keeps APK intact in auto mode)
+            # Bypass extraction for APK/Office/Packages
             ext_mode = task_data.get("extract_mode", "auto")
             extract_dir = os.path.join(work_dir, "extracted")
             extracted = False
@@ -925,15 +934,23 @@ async def process_task(task_id: str, should_test: bool):
             ACTIVE_TASKS.pop(task_id, None)
             gc.collect()
 
-# ==================== COMMAND HANDLERS ====================
+# ==================== DEBUG SNIFFER ====================
+@app.on_message(group=-1)
+async def global_debug_sniffer(client: Client, message: Message):
+    uid = message.from_user.id if message.from_user else 0
+    text_content = message.text or message.caption or f"[Media: {message.media}]"
+    logger.info(f"--- [DEBUG SNIFFER] User: {uid} | Message: {text_content} ---")
+    message.continue_propagation()
+
+# ==================== BOT HANDLERS ====================
 @app.on_message(filters.command(["start", "help"]))
 async def start_handler(client: Client, message: Message):
     sender_id = message.from_user.id if message.from_user else 0
-    logger.info(f"Received /start from User ID: {sender_id}")
+    logger.info(f"Handling /start for User ID: {sender_id}")
 
     if not is_authorized(sender_id):
         await message.reply(
-            f"**Access Denied.**\nYour User ID is: `{sender_id}`\nAsk the bot admin to grant you access."
+            f"**Access Denied.**\nYour User ID is: `{sender_id}`\nAsk the admin to add your ID to the access panel."
         )
         return
 
@@ -948,7 +965,7 @@ async def start_handler(client: Client, message: Message):
         "**Smart Packaging:**\n"
         "Files like `.apk`, `.xapk`, `.ipa`, `.docx`, `.epub` are compressed **directly without extraction**.\n\n"
         "**Commands:**\n"
-        "- `/settings` - Set your default preferences\n"
+        "- `/settings` - Configure default preferences\n"
         "- `/setthumb` - Reply to an image to set archive thumbnail\n"
         "- `/delthumb` - Remove your thumbnail\n"
         "- `/status` - Server CPU, RAM & Disk\n"
@@ -957,7 +974,7 @@ async def start_handler(client: Client, message: Message):
     )
     await message.reply(help_text)
 
-# ==================== ADMIN PANEL HANDLERS ====================
+# ==================== ADMIN PANEL ====================
 @app.on_message(filters.command("admin"))
 async def admin_cmd_handler(client: Client, message: Message):
     sender_id = message.from_user.id if message.from_user else 0
@@ -1130,7 +1147,7 @@ async def setthumb_handler(client: Client, message: Message):
         return
     reply = message.reply_to_message
     if not reply or not (reply.photo or (reply.document and reply.document.mime_type and reply.document.mime_type.startswith("image/"))):
-        await message.reply("Reply to a photo with `/setthumb` to save it as your archive thumbnail.")
+        await message.reply("Reply to an image with `/setthumb` to save it as archive thumbnail.")
         return
     thumb_path = os.path.join(DATA_DIR, f"thumb_{message.from_user.id}.jpg")
     await reply.download(file_name=thumb_path)
@@ -1407,7 +1424,6 @@ async def text_input_handler(client: Client, message: Message):
     input_type = wait_info["type"]
     raw_input = message.text.strip().split("\n")[0].strip()
 
-    # Handle Admin Adding a User
     if input_type == "admin_add_user":
         if not is_admin(user_id):
             return
@@ -1423,7 +1439,6 @@ async def text_input_handler(client: Client, message: Message):
             await message.reply("This user ID is already authorized.", reply_markup=get_admin_panel_markup())
         return
 
-    # Handle Task Settings Inputs
     task_id = wait_info.get("task_id")
     task_data = ACTIVE_TASKS.get(task_id)
     if not task_data:
@@ -1555,6 +1570,10 @@ async def main():
     cleaned = cleanup_orphaned_dirs()
     if cleaned:
         logger.info(f"Cleaned {cleaned} orphaned directories on startup.")
+    
+    # Reset existing webhooks so Pyrogram polling works instantly
+    await clear_active_webhook()
+
     await start_web_health()
     await app.start()
     logger.info("RAR5 Pro Bot started successfully.")
