@@ -94,12 +94,13 @@ HTTP_HEADERS = {
     "Connection": "keep-alive"
 }
 
+# Use in_memory=True to prevent corrupted session files from blocking updates on container restarts
 app = Client(
     "rar_worker_bot",
     api_id=API_ID,
     api_hash=API_HASH,
     bot_token=BOT_TOKEN,
-    workdir=DATA_DIR
+    in_memory=True
 )
 
 # ==================== DATA PERSISTENCE ====================
@@ -144,6 +145,8 @@ def is_admin(user_id: int) -> bool:
 def is_authorized(user_id: int) -> bool:
     if is_admin(user_id):
         return True
+    if ADMIN_ID == 0 and not ADMIN_CONFIG.get("allowed_users"):
+        return True
     if not ADMIN_CONFIG.get("whitelist_only", True):
         return True
     return user_id in ADMIN_CONFIG.get("allowed_users", [])
@@ -183,7 +186,7 @@ def cleanup_orphaned_dirs():
     return removed
 
 async def clear_active_webhook():
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook?drop_pending_updates=True"
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook?drop_pending_updates=False"
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(url, timeout=10) as resp:
@@ -940,7 +943,7 @@ async def global_debug_sniffer(client: Client, message: Message):
     message.continue_propagation()
 
 # ==================== BOT HANDLERS ====================
-@app.on_message(filters.command(["start", "help"]))
+@app.on_message(filters.command(["start", "help"]) | filters.regex(r"^/(start|help)"))
 async def start_handler(client: Client, message: Message):
     sender_id = message.from_user.id if message.from_user else 0
     logger.info(f"Handling /start for User ID: {sender_id}")
@@ -1572,7 +1575,14 @@ async def main():
     await start_web_health()
 
     await app.start()
-    logger.info("RAR5 Pro Bot started successfully.")
+    me = await app.get_me()
+    logger.info(f"RAR5 Pro Bot started successfully as @{me.username} (ID: {me.id})")
+
+    if ADMIN_ID:
+        try:
+            await app.send_message(ADMIN_ID, "**Bot Online!**\nSend `/start` or `/admin` to begin.")
+        except Exception as e:
+            logger.warning(f"Could not send startup greeting to ADMIN_ID ({ADMIN_ID}): {e}")
 
     await idle()
 
@@ -1581,6 +1591,6 @@ async def main():
 
 if __name__ == "__main__":
     try:
-        asyncio.run(main())
+        app.run(main())
     except (KeyboardInterrupt, SystemExit):
         pass
