@@ -40,7 +40,10 @@ if not raw_api_id.isdigit():
 API_ID = int(raw_api_id)
 API_HASH = os.getenv("API_HASH", "").strip()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-ALLOWED_USERS_RAW = os.getenv("ALLOWED_USERS", "")
+
+raw_admin_id = os.getenv("ADMIN_ID", "0").strip()
+ADMIN_ID = int(raw_admin_id) if raw_admin_id.isdigit() else 0
+
 DEFAULT_SPLIT_SIZE = os.getenv("SPLIT_SIZE", "1950m")
 PORT = int(os.getenv("PORT", "8080"))
 MAX_CONCURRENT_TASKS = int(os.getenv("MAX_CONCURRENT", "1"))
@@ -49,19 +52,13 @@ DATA_DIR = os.getenv("DATA_DIR", "./bot_data")
 
 os.makedirs(DATA_DIR, exist_ok=True)
 PREFS_FILE = os.path.join(DATA_DIR, "user_prefs.json")
-
-ALLOWED_USERS = set()
-if ALLOWED_USERS_RAW:
-    for uid in ALLOWED_USERS_RAW.split(","):
-        uid_clean = uid.strip()
-        if uid_clean.isdigit():
-            ALLOWED_USERS.add(int(uid_clean))
+ADMIN_DATA_FILE = os.path.join(DATA_DIR, "admin_data.json")
 
 if not API_HASH or not BOT_TOKEN:
     logger.critical("FATAL: API_HASH and BOT_TOKEN are required.")
     sys.exit(1)
 
-# Extensions that look like archives (ZIP-based) but MUST NOT be extracted in Auto mode
+# Files that must NOT be extracted in Auto mode (APK, Office, Packages)
 NO_EXTRACT_EXTENSIONS = {
     ".apk", ".xapk", ".apks", ".apkm", ".aab", ".jar", ".war", ".ear",
     ".ipa", ".msix", ".appx", ".deb", ".rpm", ".whl", ".egg",
@@ -85,8 +82,12 @@ EXTRACT_MODES = ["auto", "never", "force"]
 BOT_START_TIME = time.time()
 task_semaphore = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
 ACTIVE_TASKS = {}
-AWAITING_INPUT = {}  # user_id -> {"task_id": str, "type": "rename" | "password" | "split"}
+AWAITING_INPUT = {}
 USER_PREFS = {}
+ADMIN_CONFIG = {
+    "whitelist_only": True,
+    "allowed_users": []
+}
 
 HTTP_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
@@ -103,23 +104,51 @@ app = Client(
     workdir=DATA_DIR
 )
 
-# ==================== PERSISTENCE & PREFS ====================
-def load_prefs():
-    global USER_PREFS
+# ==================== PERSISTENCE & DATA ====================
+def load_all_data():
+    global USER_PREFS, ADMIN_CONFIG
     if os.path.exists(PREFS_FILE):
         try:
             with open(PREFS_FILE, "r", encoding="utf-8") as f:
                 USER_PREFS = json.load(f)
         except Exception as e:
-            logger.warning(f"Failed to load user prefs: {e}")
+            logger.warning(f"Error loading user prefs: {e}")
             USER_PREFS = {}
+
+    if os.path.exists(ADMIN_DATA_FILE):
+        try:
+            with open(ADMIN_DATA_FILE, "r", encoding="utf-8") as f:
+                ADMIN_CONFIG = json.load(f)
+        except Exception as e:
+            logger.warning(f"Error loading admin data: {e}")
+
+    if ADMIN_ID and ADMIN_ID not in ADMIN_CONFIG.get("allowed_users", []):
+        ADMIN_CONFIG.setdefault("allowed_users", []).append(ADMIN_ID)
+        save_admin_data()
 
 def save_prefs():
     try:
         with open(PREFS_FILE, "w", encoding="utf-8") as f:
             json.dump(USER_PREFS, f, indent=2)
     except Exception as e:
-        logger.warning(f"Failed to save user prefs: {e}")
+        logger.warning(f"Error saving user prefs: {e}")
+
+def save_admin_data():
+    try:
+        with open(ADMIN_DATA_FILE, "w", encoding="utf-8") as f:
+            json.dump(ADMIN_CONFIG, f, indent=2)
+    except Exception as e:
+        logger.warning(f"Error saving admin data: {e}")
+
+def is_admin(user_id: int) -> bool:
+    return ADMIN_ID > 0 and user_id == ADMIN_ID
+
+def is_authorized(user_id: int) -> bool:
+    if is_admin(user_id):
+        return True
+    if not ADMIN_CONFIG.get("whitelist_only", True):
+        return True
+    return user_id in ADMIN_CONFIG.get("allowed_users", [])
 
 def get_user_prefs(user_id: int) -> dict:
     uid = str(user_id)
@@ -155,7 +184,7 @@ def cleanup_orphaned_dirs():
         logger.warning(f"Startup cleanup error: {e}")
     return removed
 
-# ==================== HELPER FUNCTIONS ====================
+# ==================== HELPERS ====================
 def human_size(size_bytes: int | float) -> str:
     if not size_bytes or size_bytes <= 0:
         return "0 B"
@@ -193,17 +222,11 @@ def strip_known_archive_ext(filename: str) -> str:
             return filename[:-len(compound)]
     return os.path.splitext(filename)[0]
 
-def is_authorized(user_id: int) -> bool:
-    if not ALLOWED_USERS:
-        return True
-    return user_id in ALLOWED_USERS
-
 def should_extract_file(file_path: str, extract_mode: str) -> bool:
     if extract_mode == "never":
         return False
     if extract_mode == "force":
         return True
-    # Auto mode: check against package/office extensions
     ext = os.path.splitext(file_path)[1].lower()
     if ext in NO_EXTRACT_EXTENSIONS:
         return False
@@ -243,13 +266,8 @@ def compute_hashes(file_path: str) -> tuple[str, str]:
             sha256.update(chunk)
     return md5.hexdigest(), sha256.hexdigest()
 
-# ==================== URL & NETWORK ====================
+# ==================== URL PARSER & DOWNLOAD ====================
 def parse_link_message(text: str) -> tuple[str, str | None, dict]:
-    """
-    Supports formats:
-    1) https://example.com/file.zip CustomName
-    2) https://example.com/file.zip | CustomName | Cookie: a=b; Referer: https://...
-    """
     custom_headers = {}
     custom_name = None
 
@@ -270,9 +288,10 @@ def parse_link_message(text: str) -> tuple[str, str | None, dict]:
             custom_name = parts[1].split("\n")[0].strip()
 
     if custom_name:
-        custom_name = sanitize_filename(custom_name)
-        if custom_name.lower().endswith(".rar"):
-            custom_name = custom_name[:-4].strip()
+        clean_name = sanitize_filename(custom_name)
+        if clean_name.lower().endswith(".rar"):
+            clean_name = clean_name[:-4].strip()
+        custom_name = clean_name
 
     return url, custom_name, custom_headers
 
@@ -319,11 +338,14 @@ async def validate_url(url: str, extra_headers: dict = None) -> tuple[bool, str,
                     return False, "Access forbidden (403 Forbidden).", "", 0
                 else:
                     return False, f"HTTP {resp.status}: {resp.reason}", "", 0
-
     except Exception as e:
         return False, f"Validation error: {type(e).__name__} - {e}", "", 0
 
-# ==================== UI MARKUPS & TEXT ====================
+# ==================== UI MARKUPS ====================
+def render_bar(percent: float) -> str:
+    filled = max(0, min(10, int(percent // 10)))
+    return "█" * filled + "░" * (10 - filled)
+
 def get_cancel_markup(task_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("Cancel Task", callback_data=f"cancel:{task_id}")]
@@ -341,10 +363,10 @@ def get_setup_markup(task_id: str) -> InlineKeyboardMarkup:
     pwd_set = "Set" if t.get("password") else "None"
     hp_label = "Full (-hp)" if t.get("encrypt_headers", True) else "Data (-p)"
 
-    rows = [
+    return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("Start + Test (rar t)", callback_data=f"start:yes:{task_id}"),
-            InlineKeyboardButton("Start (Fast / No Test)", callback_data=f"start:no:{task_id}")
+            InlineKeyboardButton("Start (Fast)", callback_data=f"start:no:{task_id}")
         ],
         [
             InlineKeyboardButton(f"Level: m{lvl}", callback_data=f"cfg:lvl:{task_id}"),
@@ -362,11 +384,10 @@ def get_setup_markup(task_id: str) -> InlineKeyboardMarkup:
             InlineKeyboardButton(f"Enc: {hp_label}", callback_data=f"cfg:enc:{task_id}")
         ],
         [
-            InlineKeyboardButton("Custom Split Size", callback_data=f"input:split:{task_id}"),
+            InlineKeyboardButton("Custom Split", callback_data=f"input:split:{task_id}"),
             InlineKeyboardButton("Cancel", callback_data=f"cancel:{task_id}")
         ]
-    ]
-    return InlineKeyboardMarkup(rows)
+    ])
 
 def get_setup_text(task_data: dict) -> str:
     name = task_data.get("custom_name") or task_data.get("default_name")
@@ -378,28 +399,41 @@ def get_setup_text(task_data: dict) -> str:
     size_val = task_data.get("remote_size", 0)
     size_str = f"`{human_size(size_val)}`" if size_val > 0 else "`Unknown`"
     pwd = task_data.get("password")
-    pwd_str = f"`{'*' * len(pwd)}` ({'Headers+Data' if task_data.get('encrypt_headers', True) else 'Data Only'})" if pwd else "`None`"
+    pwd_str = f"`{'*' * len(pwd)}` ({'Full -hp' if task_data.get('encrypt_headers', True) else 'Data -p'})" if pwd else "`None`"
     split_val = task_data.get("split", "0")
     split_str = "`Single Archive`" if split_val in ("0", "", None) else f"`{split_val}`"
 
     return (
-        f"**Archive Setup Panel**\n\n"
+        f"**Archive Configuration**\n\n"
         f"- **Source File:** `{orig_file}`\n"
-        f"- **Target Output:** `{name}.rar`\n"
+        f"- **Target Archive:** `{name}.rar`\n"
         f"- **Source Size:** {size_str}\n"
         f"- **Extraction Mode:** {extract_status}\n"
         f"- **Compression:** `{COMPRESSION_LEVELS.get(task_data.get('level', 5))}`\n"
         f"- **Split Size:** {split_str} | **Dict:** `{task_data.get('dict_size', '64m')}`\n"
         f"- **Solid:** `{'Yes' if task_data.get('solid') else 'No'}` | **Recovery:** `{'3%' if task_data.get('recovery') else 'Off'}`\n"
         f"- **Password:** {pwd_str}\n\n"
-        f"Adjust options below or press **Start**:"
+        f"Press buttons to adjust settings, then choose **Start**:"
     )
 
-# ==================== PROGRESS & ERROR HANDLERS ====================
-def render_bar(percent: float) -> str:
-    filled = max(0, min(10, int(percent // 10)))
-    return "█" * filled + "░" * (10 - filled)
+# ==================== ADMIN PANEL MARKUP ====================
+def get_admin_panel_markup() -> InlineKeyboardMarkup:
+    lock_status = "Whitelist Only (Private)" if ADMIN_CONFIG.get("whitelist_only", True) else "Open to All (Public)"
+    users_count = len(ADMIN_CONFIG.get("allowed_users", []))
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"Mode: {lock_status}", callback_data="adm:togglemode")],
+        [
+            InlineKeyboardButton("Add User ID", callback_data="adm:adduser"),
+            InlineKeyboardButton("Remove User", callback_data="adm:deluser")
+        ],
+        [
+            InlineKeyboardButton(f"View User List ({users_count})", callback_data="adm:listusers"),
+            InlineKeyboardButton("Server Status", callback_data="adm:status")
+        ],
+        [InlineKeyboardButton("Close Panel", callback_data="adm:close")]
+    ])
 
+# ==================== PROGRESS & SUBPROCESS ====================
 async def progress_callback(current, total, status_msg: Message, action_name: str, state: dict, task_id: str):
     task_info = ACTIVE_TASKS.get(task_id)
     if task_info and task_info.get("cancelled"):
@@ -486,7 +520,7 @@ async def send_detailed_error(message: Message, status_msg: Message, stage: str,
         if len(content) <= 4000:
             await status_msg.edit_text(content)
         else:
-            await status_msg.edit_text(f"**Error in stage `{stage}`:** `{error_type} - {error_msg}`\nFull diagnostic log attached below.")
+            await status_msg.edit_text(f"**Error in stage `{stage}`:** `{error_type} - {error_msg}`\nLog attached below.")
             full_log = f"Stage: {stage}\nError: {error_type} - {error_msg}\n\nProcess Log:\n{extra_log}\n\nTraceback:\n{tb}"
             file_data = BytesIO(full_log.encode("utf-8"))
             file_data.name = "error_report.txt"
@@ -494,7 +528,6 @@ async def send_detailed_error(message: Message, status_msg: Message, stage: str,
     except Exception as err:
         logger.error(f"Failed to deliver error report: {err}")
 
-# ==================== CORE WORKER PROCESSES ====================
 async def try_extract_archive(file_path: str, extract_to: str, task_id: str) -> tuple[bool, str]:
     test_proc = await asyncio.create_subprocess_exec(
         "7z", "t", file_path,
@@ -506,7 +539,7 @@ async def try_extract_archive(file_path: str, extract_to: str, task_id: str) -> 
 
     stdout, stderr = await test_proc.communicate()
     if test_proc.returncode != 0:
-        return False, "File is not a standard archive or is password-protected."
+        return False, "File is not a supported archive or is password-protected."
 
     os.makedirs(extract_to, exist_ok=True)
     extract_proc = await asyncio.create_subprocess_exec(
@@ -547,10 +580,7 @@ async def run_rar_compression(input_target: str, output_rar_archive: str, status
     if split and split not in ("0", "none", "off"):
         cmd.append(f"-v{split}")
     if password:
-        if enc_headers:
-            cmd.append(f"-hp{password}")
-        else:
-            cmd.append(f"-p{password}")
+        cmd.append(f"-hp{password}" if enc_headers else f"-p{password}")
 
     if os.path.isdir(input_target):
         working_dir = input_target
@@ -645,7 +675,6 @@ async def download_stream_url(url: str, dest_path: str, status_msg: Message, tas
                     if resp.status not in (200, 206):
                         return False, f"HTTP Status {resp.status}: {resp.reason}"
                     if resp.status == 200 and downloaded > 0:
-                        # Server doesn't support Range; restart from 0
                         downloaded = 0
                         file_mode = "wb"
                     if total_size == 0:
@@ -700,7 +729,7 @@ async def safe_reply_document(message: Message, document: str, caption: str, thu
             logger.warning(f"FloodWait of {e.value}s during upload...")
             await asyncio.sleep(e.value + 1)
 
-# ==================== MAIN TASK PIPELINE ====================
+# ==================== MAIN TASK WORKFLOW ====================
 async def process_task(task_id: str, should_test: bool):
     task_data = ACTIVE_TASKS.get(task_id)
     if not task_data:
@@ -726,7 +755,6 @@ async def process_task(task_id: str, should_test: bool):
             if task_data.get("cancelled"):
                 raise asyncio.CancelledError()
 
-            # Disk Space Guard
             expected_size = task_data.get("remote_size", 0)
             free_disk = shutil.disk_usage(WORK_BASE_DIR).free
             if expected_size > 0 and expected_size * 2.2 > free_disk:
@@ -765,7 +793,7 @@ async def process_task(task_id: str, should_test: bool):
 
             initial_size = os.path.getsize(file_path) if os.path.exists(file_path) else 0
 
-            # Smart Extraction Check (APK & package protection)
+            # Extraction check (Keeps APK intact in auto mode)
             ext_mode = task_data.get("extract_mode", "auto")
             extract_dir = os.path.join(work_dir, "extracted")
             extracted = False
@@ -780,7 +808,6 @@ async def process_task(task_id: str, should_test: bool):
 
             if extracted:
                 target = extract_dir
-                # Progressive Cleanup #1: Delete downloaded archive immediately to save disk space
                 try:
                     os.remove(file_path)
                 except Exception:
@@ -801,7 +828,6 @@ async def process_task(task_id: str, should_test: bool):
             if not success:
                 raise RuntimeError(f"RAR execution failed:\n{rar_log}")
 
-            # Progressive Cleanup #2: Delete source/extracted files before testing & uploading
             try:
                 if os.path.isdir(target):
                     shutil.rmtree(target, ignore_errors=True)
@@ -832,7 +858,6 @@ async def process_task(task_id: str, should_test: bool):
             if task_data.get("cancelled"):
                 raise asyncio.CancelledError()
 
-            # Upload Stage & Checksums
             stage = "Uploading Part(s)"
             total_compressed_size = sum(os.path.getsize(p) for p in generated_parts)
             thumb_path = get_user_thumb(user_id)
@@ -868,7 +893,6 @@ async def process_task(task_id: str, should_test: bool):
                     task_id=task_id
                 )
 
-            # Final Summary Report
             elapsed_total = time.time() - task_start_ts
             ratio = ((initial_size - total_compressed_size) / initial_size * 100) if initial_size > 0 else 0.0
             ratio_str = f"{ratio:.1f}% saved" if ratio >= 0 else f"{abs(ratio):.1f}% larger"
@@ -904,28 +928,155 @@ async def process_task(task_id: str, should_test: bool):
 # ==================== COMMAND HANDLERS ====================
 @app.on_message(filters.command(["start", "help"]))
 async def start_handler(client: Client, message: Message):
-    if not is_authorized(message.from_user.id):
-        await message.reply("Access denied.")
+    sender_id = message.from_user.id if message.from_user else 0
+    logger.info(f"Received /start from User ID: {sender_id}")
+
+    if not is_authorized(sender_id):
+        await message.reply(
+            f"**Access Denied.**\nYour User ID is: `{sender_id}`\nAsk the bot admin to grant you access."
+        )
         return
+
+    admin_notice = "\n- `/admin` - Open Admin Management Panel" if is_admin(sender_id) else ""
     help_text = (
         "**RAR5 Pro Compression Bot**\n\n"
         "**How to use:**\n"
-        "1. Send or forward any Telegram file (Document, Video, Audio, APK, etc.).\n"
+        "1. Send or forward any file (Document, Video, Audio, APK, etc.).\n"
         "2. Or send a direct download link:\n"
         "   `https://example.com/file.apk`\n"
         "   `https://example.com/file.zip | CustomName | Cookie: a=b`\n\n"
-        "**Smart APK/Package Handling:**\n"
-        "Files like `.apk`, `.xapk`, `.jar`, `.ipa`, `.docx`, `.epub` are compressed **directly without extraction** in `Auto` mode.\n\n"
+        "**Smart Packaging:**\n"
+        "Files like `.apk`, `.xapk`, `.ipa`, `.docx`, `.epub` are compressed **directly without extraction**.\n\n"
         "**Commands:**\n"
-        "- `/settings` - Configure your default compression settings\n"
-        "- `/setthumb` - Reply to a photo to set custom thumbnail\n"
-        "- `/delthumb` - Remove your custom thumbnail\n"
-        "- `/status` - Show server CPU, RAM, Disk & Uptime\n"
-        "- `/queue` - View active and queued tasks\n"
-        "- `/clean` - Force clean temporary directories"
+        "- `/settings` - Set your default preferences\n"
+        "- `/setthumb` - Reply to an image to set archive thumbnail\n"
+        "- `/delthumb` - Remove your thumbnail\n"
+        "- `/status` - Server CPU, RAM & Disk\n"
+        "- `/queue` - View active tasks"
+        f"{admin_notice}"
     )
     await message.reply(help_text)
 
+# ==================== ADMIN PANEL HANDLERS ====================
+@app.on_message(filters.command("admin"))
+async def admin_cmd_handler(client: Client, message: Message):
+    sender_id = message.from_user.id if message.from_user else 0
+    if not is_admin(sender_id):
+        await message.reply("Access denied. Admin only command.")
+        return
+
+    await message.reply(
+        "**Admin Management Panel**\nControl bot access, view users, and check system status:",
+        reply_markup=get_admin_panel_markup()
+    )
+
+@app.on_callback_query(filters.regex(r"^adm:(\w+)$"))
+async def admin_callback_handler(client: Client, cq: CallbackQuery):
+    sender_id = cq.from_user.id
+    if not is_admin(sender_id):
+        await cq.answer("Unauthorized.", show_alert=True)
+        return
+
+    action = cq.data.split(":")[1]
+
+    if action == "close":
+        await cq.message.delete()
+        return
+
+    elif action == "togglemode":
+        ADMIN_CONFIG["whitelist_only"] = not ADMIN_CONFIG.get("whitelist_only", True)
+        save_admin_data()
+        mode_str = "Whitelist Only (Private)" if ADMIN_CONFIG["whitelist_only"] else "Open to All (Public)"
+        await cq.answer(f"Bot mode changed to: {mode_str}")
+        try:
+            await cq.message.edit_reply_markup(reply_markup=get_admin_panel_markup())
+        except MessageNotModified:
+            pass
+
+    elif action == "adduser":
+        AWAITING_INPUT[sender_id] = {"type": "admin_add_user"}
+        await cq.answer()
+        cancel_btn = InlineKeyboardMarkup([[InlineKeyboardButton("Back to Admin", callback_data="adm:panel")]])
+        await cq.message.edit_text(
+            "Send the **numeric Telegram User ID** to grant bot access:",
+            reply_markup=cancel_btn
+        )
+
+    elif action == "deluser":
+        allowed = [u for u in ADMIN_CONFIG.get("allowed_users", []) if u != ADMIN_ID]
+        if not allowed:
+            await cq.answer("No additional users to remove.", show_alert=True)
+            return
+        buttons = []
+        for uid in allowed:
+            buttons.append([InlineKeyboardButton(f"Remove ID: {uid}", callback_data=f"adm_rm:{uid}")])
+        buttons.append([InlineKeyboardButton("Back to Admin", callback_data="adm:panel")])
+        await cq.message.edit_text("Select a user to revoke access:", reply_markup=InlineKeyboardMarkup(buttons))
+
+    elif action == "listusers":
+        allowed = ADMIN_CONFIG.get("allowed_users", [])
+        mode_str = "Private (Whitelist)" if ADMIN_CONFIG.get("whitelist_only", True) else "Public (Open)"
+        text = f"**Authorized Users ({len(allowed)})**\nMode: `{mode_str}`\nAdmin ID: `{ADMIN_ID}`\n\n"
+        for uid in allowed:
+            tag = " (Admin)" if uid == ADMIN_ID else ""
+            text += f"- `{uid}`{tag}\n"
+        back_btn = InlineKeyboardMarkup([[InlineKeyboardButton("Back to Admin", callback_data="adm:panel")]])
+        await cq.message.edit_text(text, reply_markup=back_btn)
+
+    elif action == "status":
+        st = get_system_stats()
+        active_count = sum(1 for t in ACTIVE_TASKS.values() if t.get("running"))
+        queued_count = len(ACTIVE_TASKS) - active_count
+        text = (
+            "**Server & Bot Status**\n\n"
+            f"- **Uptime:** `{st['uptime']}`\n"
+            f"- **System Load:** `{st['load']}`\n"
+            f"- **RAM Used:** `{human_size(st['mem_used'])}` / `{human_size(st['mem_total'])}`\n"
+            f"- **Disk Free:** `{human_size(st['disk_free'])}` / `{human_size(st['disk_total'])}` (`{st['disk_percent']}% used`)\n"
+            f"- **Tasks:** `{active_count} Running` | `{queued_count} Queued/Setup`"
+        )
+        back_btn = InlineKeyboardMarkup([[InlineKeyboardButton("Back to Admin", callback_data="adm:panel")]])
+        await cq.message.edit_text(text, reply_markup=back_btn)
+
+    elif action == "panel":
+        AWAITING_INPUT.pop(sender_id, None)
+        await cq.message.edit_text(
+            "**Admin Management Panel**\nControl bot access, view users, and check system status:",
+            reply_markup=get_admin_panel_markup()
+        )
+
+@app.on_callback_query(filters.regex(r"^adm_rm:(\d+)$"))
+async def admin_remove_user_callback(client: Client, cq: CallbackQuery):
+    sender_id = cq.from_user.id
+    if not is_admin(sender_id):
+        await cq.answer("Unauthorized.", show_alert=True)
+        return
+
+    target_id = int(cq.data.split(":")[1])
+    if target_id == ADMIN_ID:
+        await cq.answer("Cannot remove the primary admin.", show_alert=True)
+        return
+
+    if target_id in ADMIN_CONFIG.get("allowed_users", []):
+        ADMIN_CONFIG["allowed_users"].remove(target_id)
+        save_admin_data()
+        await cq.answer(f"Removed User ID: {target_id}")
+
+    allowed = [u for u in ADMIN_CONFIG.get("allowed_users", []) if u != ADMIN_ID]
+    if not allowed:
+        await cq.message.edit_text("No remaining users.", reply_markup=get_admin_panel_markup())
+        return
+
+    buttons = []
+    for uid in allowed:
+        buttons.append([InlineKeyboardButton(f"Remove ID: {uid}", callback_data=f"adm_rm:{uid}")])
+    buttons.append([InlineKeyboardButton("Back to Admin", callback_data="adm:panel")])
+    try:
+        await cq.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(buttons))
+    except MessageNotModified:
+        pass
+
+# ==================== GENERAL COMMANDS ====================
 @app.on_message(filters.command("status"))
 async def status_cmd_handler(client: Client, message: Message):
     if not is_authorized(message.from_user.id):
@@ -956,21 +1107,22 @@ async def queue_cmd_handler(client: Client, message: Message):
         name = tdata.get("custom_name") or tdata.get("default_name")
         state = "Running" if tdata.get("running") else "Setup / Waiting"
         lines.append(f"- `{tid}`: `{name}.rar` [{state}]")
-        if tdata.get("user_id") == message.from_user.id:
+        if tdata.get("user_id") == message.from_user.id or is_admin(message.from_user.id):
             buttons.append([InlineKeyboardButton(f"Cancel {tid} ({name[:15]})", callback_data=f"cancel:{tid}")])
     markup = InlineKeyboardMarkup(buttons) if buttons else None
     await message.reply("\n".join(lines), reply_markup=markup)
 
 @app.on_message(filters.command("clean"))
 async def clean_cmd_handler(client: Client, message: Message):
-    if not is_authorized(message.from_user.id):
+    if not is_admin(message.from_user.id):
+        await message.reply("Only the admin can perform cache cleaning.")
         return
     if any(t.get("running") for t in ACTIVE_TASKS.values()):
-        await message.reply("Cannot force-clean while a task is actively running. Cancel active tasks first.")
+        await message.reply("Cannot force-clean while a task is running.")
         return
     removed = cleanup_orphaned_dirs()
     gc.collect()
-    await message.reply(f"Cleaned `{removed}` temporary workspace directories and freed memory.")
+    await message.reply(f"Cleaned `{removed}` temporary directories and freed memory.")
 
 @app.on_message(filters.command("setthumb"))
 async def setthumb_handler(client: Client, message: Message):
@@ -978,11 +1130,11 @@ async def setthumb_handler(client: Client, message: Message):
         return
     reply = message.reply_to_message
     if not reply or not (reply.photo or (reply.document and reply.document.mime_type and reply.document.mime_type.startswith("image/"))):
-        await message.reply("Reply to a photo with `/setthumb` to save it as your default archive thumbnail.")
+        await message.reply("Reply to a photo with `/setthumb` to save it as your archive thumbnail.")
         return
     thumb_path = os.path.join(DATA_DIR, f"thumb_{message.from_user.id}.jpg")
     await reply.download(file_name=thumb_path)
-    await message.reply("Custom thumbnail saved successfully.")
+    await message.reply("Custom thumbnail saved.")
 
 @app.on_message(filters.command("delthumb"))
 async def delthumb_handler(client: Client, message: Message):
@@ -993,7 +1145,7 @@ async def delthumb_handler(client: Client, message: Message):
         os.remove(thumb_path)
         await message.reply("Custom thumbnail removed.")
     else:
-        await message.reply("You don't have a custom thumbnail set.")
+        await message.reply("No thumbnail found.")
 
 def get_user_settings_markup(user_id: int) -> InlineKeyboardMarkup:
     p = get_user_prefs(user_id)
@@ -1020,7 +1172,7 @@ async def settings_cmd_handler(client: Client, message: Message):
     if not is_authorized(message.from_user.id):
         return
     await message.reply(
-        "**Your Default Preferences**\nThese settings are automatically applied to every new file or link you send:",
+        "**Your Default Preferences**\nApplied to every new task automatically:",
         reply_markup=get_user_settings_markup(message.from_user.id)
     )
 
@@ -1058,7 +1210,7 @@ async def upref_callback_handler(client: Client, cq: CallbackQuery):
     except MessageNotModified:
         pass
 
-# ==================== FILE & LINK HANDLERS ====================
+# ==================== FILE & LINK ROUTING ====================
 def create_initial_task_dict(user_id: int, mode: str, message: Message, orig_filename: str, default_name: str, custom_name: str | None, remote_size: int = 0) -> dict:
     prefs = get_user_prefs(user_id)
     return {
@@ -1088,7 +1240,7 @@ def create_initial_task_dict(user_id: int, mode: str, message: Message, orig_fil
 async def file_handler(client: Client, message: Message):
     user_id = message.from_user.id if message.from_user else 0
     if not is_authorized(user_id):
-        await message.reply("Access denied.")
+        await message.reply(f"Access denied. Your User ID is: `{user_id}`")
         return
 
     task_id = uuid.uuid4().hex[:8]
@@ -1127,7 +1279,7 @@ async def file_handler(client: Client, message: Message):
 async def link_handler(client: Client, message: Message):
     user_id = message.from_user.id if message.from_user else 0
     if not is_authorized(user_id):
-        await message.reply("Access denied.")
+        await message.reply(f"Access denied. Your User ID is: `{user_id}`")
         return
 
     url, custom_name, extra_headers = parse_link_message(message.text)
@@ -1161,7 +1313,7 @@ async def link_handler(client: Client, message: Message):
         reply_markup=get_setup_markup(task_id)
     )
 
-# ==================== INTERACTIVE SETUP CALLBACKS ====================
+# ==================== TASK SETUP CALLBACKS ====================
 @app.on_callback_query(filters.regex(r"^cfg:(lvl|split|ext|solid|rr|dict|enc):([a-f0-9]+)$"))
 async def config_toggle_callback(client: Client, cq: CallbackQuery):
     _, field, task_id = cq.data.split(":")
@@ -1170,7 +1322,7 @@ async def config_toggle_callback(client: Client, cq: CallbackQuery):
     if not task_data:
         await cq.answer("Task expired or not found.", show_alert=True)
         return
-    if cq.from_user.id != task_data["user_id"]:
+    if cq.from_user.id != task_data["user_id"] and not is_admin(cq.from_user.id):
         await cq.answer("Unauthorized.", show_alert=True)
         return
 
@@ -1212,7 +1364,7 @@ async def input_request_callback(client: Client, cq: CallbackQuery):
     if not task_data:
         await cq.answer("Task expired or not found.", show_alert=True)
         return
-    if cq.from_user.id != task_data["user_id"]:
+    if cq.from_user.id != task_data["user_id"] and not is_admin(cq.from_user.id):
         await cq.answer("Unauthorized.", show_alert=True)
         return
 
@@ -1221,7 +1373,7 @@ async def input_request_callback(client: Client, cq: CallbackQuery):
 
     prompts = {
         "rename": "Send the **new archive name** in chat (without `.rar` extension):",
-        "password": "Send the **archive password** in chat (or send `none` to clear password):",
+        "password": "Send the **archive password** in chat (or send `none` to remove password):",
         "split": "Send the **split volume size** (e.g. `700m`, `2g`, or `0` for no split):"
     }
     back_markup = InlineKeyboardMarkup([
@@ -1244,6 +1396,7 @@ async def back_to_setup_callback(client: Client, cq: CallbackQuery):
         reply_markup=get_setup_markup(task_id)
     )
 
+# ==================== TEXT INPUT ROUTER ====================
 @app.on_message(filters.text & ~filters.regex(r"^/"))
 async def text_input_handler(client: Client, message: Message):
     user_id = message.from_user.id if message.from_user else 0
@@ -1251,15 +1404,31 @@ async def text_input_handler(client: Client, message: Message):
         return
 
     wait_info = AWAITING_INPUT.pop(user_id)
-    task_id = wait_info["task_id"]
     input_type = wait_info["type"]
-    task_data = ACTIVE_TASKS.get(task_id)
+    raw_input = message.text.strip().split("\n")[0].strip()
 
+    # Handle Admin Adding a User
+    if input_type == "admin_add_user":
+        if not is_admin(user_id):
+            return
+        if not raw_input.isdigit():
+            await message.reply("Invalid ID! User ID must be a numeric integer.")
+            return
+        new_uid = int(raw_input)
+        if new_uid not in ADMIN_CONFIG.get("allowed_users", []):
+            ADMIN_CONFIG.setdefault("allowed_users", []).append(new_uid)
+            save_admin_data()
+            await message.reply(f"User ID `{new_uid}` added to authorized list.", reply_markup=get_admin_panel_markup())
+        else:
+            await message.reply("This user ID is already authorized.", reply_markup=get_admin_panel_markup())
+        return
+
+    # Handle Task Settings Inputs
+    task_id = wait_info.get("task_id")
+    task_data = ACTIVE_TASKS.get(task_id)
     if not task_data:
         await message.reply("Task expired or not found.")
         return
-
-    raw_input = message.text.strip().split("\n")[0].strip()
 
     if input_type == "rename":
         clean_name = sanitize_filename(raw_input)
@@ -1296,7 +1465,7 @@ async def cancel_callback_handler(client: Client, callback_query: CallbackQuery)
         await callback_query.answer("Task expired or already finished.", show_alert=True)
         return
 
-    if callback_query.from_user.id != task_data["user_id"]:
+    if callback_query.from_user.id != task_data["user_id"] and not is_admin(callback_query.from_user.id):
         await callback_query.answer("Unauthorized.", show_alert=True)
         return
 
@@ -1335,7 +1504,7 @@ async def start_task_callback(client: Client, callback_query: CallbackQuery):
         await callback_query.answer("Task expired or not found.", show_alert=True)
         return
 
-    if callback_query.from_user.id != task_data["user_id"]:
+    if callback_query.from_user.id != task_data["user_id"] and not is_admin(callback_query.from_user.id):
         await callback_query.answer("Unauthorized.", show_alert=True)
         return
 
@@ -1347,7 +1516,7 @@ async def start_task_callback(client: Client, callback_query: CallbackQuery):
     t = asyncio.create_task(process_task(task_id, should_test))
     task_data["async_task"] = t
 
-# ==================== WEB SERVER & LIFECYCLE ====================
+# ==================== WEB SERVER & APP START ====================
 async def start_web_health():
     app_web = web.Application()
 
@@ -1368,7 +1537,7 @@ async def start_web_health():
     logger.info(f"Health server listening on port {PORT}")
 
 async def shutdown_cleanup():
-    logger.info("Shutting down... terminating active subprocesses.")
+    logger.info("Shutting down... cleaning processes.")
     for tid, tdata in list(ACTIVE_TASKS.items()):
         tdata["cancelled"] = True
         proc = tdata.get("proc")
@@ -1382,7 +1551,7 @@ async def shutdown_cleanup():
             shutil.rmtree(work_dir, ignore_errors=True)
 
 async def main():
-    load_prefs()
+    load_all_data()
     cleaned = cleanup_orphaned_dirs()
     if cleaned:
         logger.info(f"Cleaned {cleaned} orphaned directories on startup.")
